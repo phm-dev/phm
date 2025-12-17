@@ -1,0 +1,23 @@
+# PHM Configuration
+# PHP Manager for macOS
+#
+# Copy this file to ~/.config/phm/phm.conf and customize
+
+# Repository URL (GitHub releases or custom server)
+# This is where PHM will download packages and index.json from
+# PHM_REPO_URL="https://github.com/USER/php-packages/releases/download/latest"
+
+# Installation prefix for PHP versions
+# PHP will be installed to /opt/php/X.Y (e.g., /opt/php/8.4)
+PHM_INSTALL_PREFIX="/opt/php"
+
+# Number of parallel downloads (for future use)
+PHM_PARALLEL_DOWNLOADS=4
+
+# Cache expiry in seconds (default: 1 hour)
+# Package index will be refreshed after this time
+PHM_CACHE_EXPIRY=3600
+
+# Auto-update index on install (true/false)
+# If true, will update index before installing packages
+PHM_AUTO_UPDATE=true

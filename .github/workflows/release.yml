@@ -44,7 +44,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           mkdir -p dist
-          go build -ldflags="-s -w -X main.Version=${{ steps.version.outputs.VERSION }}" \
+          go build -ldflags="-s -w -X main.version=${{ steps.version.outputs.VERSION }}" \
             -o dist/phm ./cmd/phm
 
       - name: Create tarball

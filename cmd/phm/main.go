@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	version = "0.2.0"
+	version = "dev" // injected via ldflags during release build
 	cfg     *config.Config
 )
 
@@ -232,6 +232,19 @@ Examples:
 	return cmd
 }
 
+// ensureSudo prompts for sudo password upfront to avoid interruptions during installation
+func ensureSudo() error {
+	fmt.Printf("\033[34m==>\033[0m Checking root privileges...\n")
+	cmd := exec.Command("sudo", "-v")
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to obtain root privileges: %w", err)
+	}
+	return nil
+}
+
 // getRepo creates and initializes repository with fresh index
 func getRepo() (*repo.Repository, error) {
 	// If --repo is set, enable offline mode
@@ -277,6 +290,11 @@ func getLinker() *pkg.Linker {
 
 // Command implementations
 func runInstall(packages []string, force bool) error {
+	// Prompt for sudo password upfront
+	if err := ensureSudo(); err != nil {
+		return err
+	}
+
 	r, err := getRepo()
 	if err != nil {
 		return err
@@ -432,9 +450,11 @@ func runInstall(packages []string, force bool) error {
 	}
 
 	if targetVersion != "" {
+		allVersions := linker.GetAvailableVersions()
 		currentDefault := linker.GetDefaultVersion()
-		if currentDefault == "" {
-			// First install - auto-set as default
+
+		if len(allVersions) == 1 {
+			// Only one PHP version installed - auto-set as default
 			fmt.Printf("\n\033[34m==>\033[0m Setting PHP %s as default...\n", targetVersion)
 			if err := linker.SetDefaultVersion(targetVersion); err != nil {
 				fmt.Printf("\033[33mWarning:\033[0m Could not set default: %v\n", err)
@@ -444,7 +464,7 @@ func runInstall(packages []string, force bool) error {
 				fmt.Printf("      Or run: phm use %s --system\n", targetVersion)
 			}
 		} else if currentDefault != targetVersion {
-			// Different version is default - ask user (once!)
+			// Multiple versions installed and different version is default - ask user
 			fmt.Printf("\n\033[33mCurrent default is PHP %s.\033[0m\n", currentDefault)
 			fmt.Printf("Set PHP %s as default? [y/N]: ", targetVersion)
 			var answer string
@@ -459,7 +479,9 @@ func runInstall(packages []string, force bool) error {
 		}
 	}
 
-	fmt.Println()
+	// Print summary
+	printInstallSummary(allToInstall, packagesToUpgrade, installedVersions, linker)
+
 	return nil
 }
 
@@ -470,6 +492,72 @@ func extractPHPVersion(name string) string {
 		return matches[1]
 	}
 	return ""
+}
+
+// printInstallSummary prints a nice summary after installation
+func printInstallSummary(installed []pkg.Package, upgraded []pkg.Package, versions map[string]bool, linker *pkg.Linker) {
+	fmt.Println()
+	separator := strings.Repeat("─", 50)
+	fmt.Printf("\033[1;32m%s\033[0m\n", separator)
+	fmt.Printf("\033[1;32m  Installation Complete!\033[0m\n")
+	fmt.Printf("\033[1;32m%s\033[0m\n\n", separator)
+
+	// Installed packages
+	if len(installed) > 0 {
+		fmt.Printf("\033[1mInstalled:\033[0m\n")
+		for _, p := range installed {
+			fmt.Printf("  \033[32m+\033[0m %s (%s)\n", p.Name, p.Version)
+		}
+	}
+
+	// Upgraded packages
+	if len(upgraded) > 0 {
+		fmt.Printf("\n\033[1mUpgraded:\033[0m\n")
+		for _, p := range upgraded {
+			fmt.Printf("  \033[34m↑\033[0m %s (%s)\n", p.Name, p.Version)
+		}
+	}
+
+	// Show PHP version for each installed version
+	for version := range versions {
+		phpBin := filepath.Join(cfg.InstallPrefix, version, "bin", "php")
+		if _, err := os.Stat(phpBin); err == nil {
+			fmt.Printf("\n\033[1mPHP %s:\033[0m\n", version)
+			cmd := exec.Command(phpBin, "-v")
+			if output, err := cmd.Output(); err == nil {
+				lines := strings.Split(string(output), "\n")
+				if len(lines) > 0 {
+					fmt.Printf("  %s\n", lines[0])
+				}
+			}
+
+			// Show loaded extensions count
+			cmd = exec.Command(phpBin, "-m")
+			if output, err := cmd.Output(); err == nil {
+				lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+				extCount := 0
+				for _, line := range lines {
+					if line != "" && line != "[PHP Modules]" && line != "[Zend Modules]" {
+						extCount++
+					}
+				}
+				fmt.Printf("  Extensions: %d loaded\n", extCount)
+			}
+		}
+	}
+
+	// Show current default
+	defaultVersion := linker.GetDefaultVersion()
+	if defaultVersion != "" {
+		fmt.Printf("\n\033[1mDefault version:\033[0m PHP %s\n", defaultVersion)
+	}
+
+	// Quick tips
+	fmt.Printf("\n\033[1mQuick tips:\033[0m\n")
+	fmt.Printf("  phm ext list           # Show available extensions\n")
+	fmt.Printf("  phm fpm start %s      # Start PHP-FPM\n", defaultVersion)
+	fmt.Printf("  phm use <version>      # Change default PHP version\n")
+	fmt.Println()
 }
 
 // expandMetaPackages expands meta-packages (slim/full) into real package lists
@@ -556,6 +644,11 @@ func packageExists(name string, available []pkg.Package) bool {
 }
 
 func runRemove(packages []string) error {
+	// Prompt for sudo password upfront
+	if err := ensureSudo(); err != nil {
+		return err
+	}
+
 	mgr := getManager()
 	if err := mgr.LoadInstalled(); err != nil {
 		return fmt.Errorf("could not load installed packages: %w", err)
@@ -747,6 +840,11 @@ func runSearch(query string) error {
 }
 
 func runUpgrade(packages []string) error {
+	// Prompt for sudo password upfront
+	if err := ensureSudo(); err != nil {
+		return err
+	}
+
 	r, err := getRepo()
 	if err != nil {
 		return err
@@ -1401,6 +1499,11 @@ func runDestruct(force bool) error {
 			fmt.Println("\nAborted.")
 			return nil
 		}
+	}
+
+	// Prompt for sudo password upfront
+	if err := ensureSudo(); err != nil {
+		return err
 	}
 
 	fmt.Println()

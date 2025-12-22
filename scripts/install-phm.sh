@@ -84,6 +84,11 @@ install_phm() {
     tar -xzf "${tmp_dir}/phm.tar.gz" -C "$tmp_dir"
 
     info "Installing to ${INSTALL_DIR}..."
+    # Create install directory if it doesn't exist
+    if [[ ! -d "$INSTALL_DIR" ]]; then
+        sudo mkdir -p "$INSTALL_DIR"
+    fi
+
     if [[ -w "$INSTALL_DIR" ]]; then
         mv "${tmp_dir}/phm" "${INSTALL_DIR}/phm"
         chmod +x "${INSTALL_DIR}/phm"
@@ -128,10 +133,9 @@ print_instructions() {
     echo -e "  ${YELLOW}export PATH=\"/opt/php/bin:\$PATH\"${NC}"
     echo ""
     echo "Quick start:"
-    echo "  phm update              # Update package index"
-    echo "  phm list                # List available PHP versions"
-    echo "  phm install php8.5      # Install PHP 8.5"
+    echo "  phm install php8.5-cli  # Install PHP 8.5 CLI"
     echo "  phm use 8.5             # Set PHP 8.5 as default"
+    echo "  phm list -a             # List available packages"
     echo "  phm ui                  # Interactive mode"
     echo ""
 }

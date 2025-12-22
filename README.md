@@ -17,10 +17,7 @@ export PATH="/opt/php/bin:$PATH"
 ## Quick Start
 
 ```bash
-# Update package index
-phm update
-
-# Install PHP 8.5 with extensions
+# Install PHP 8.5 with extensions (auto-syncs package index)
 phm install php8.5-cli php8.5-fpm php8.5-redis
 
 # Set as default version

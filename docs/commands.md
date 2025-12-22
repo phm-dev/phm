@@ -12,7 +12,6 @@ Complete reference for all PHM commands.
   - [list](#list)
   - [search](#search)
   - [info](#info)
-  - [update](#update)
 - [Version Management](#version-management)
   - [use](#use)
 - [Extension Management](#extension-management)
@@ -62,6 +61,12 @@ phm install [packages...] [flags]
 |------|-------------|
 | `-f, --force` | Force reinstall even if package is already installed |
 
+**Features:**
+
+- **Auto-sync:** Package index is automatically synced before installation
+- **Auto-upgrade:** When installing an extension (e.g., `php8.5-redis`), all other installed packages of the same PHP version are automatically upgraded first to ensure compatibility
+- **Progress bar:** Downloads show a progress bar with speed and percentage
+
 **Examples:**
 
 ```bash
@@ -73,6 +78,9 @@ phm install php8.5-cli php8.5-fpm php8.5-redis
 
 # Force reinstall
 phm install -f php8.5-cli
+
+# Install extension (auto-upgrades other php8.5-* packages first)
+phm install php8.5-redis
 ```
 
 ---
@@ -198,25 +206,6 @@ phm info php8.5-redis
 
 ---
 
-### update
-
-Update the package index from the remote repository.
-
-```bash
-phm update [flags]
-```
-
-**Examples:**
-
-```bash
-# Update package index
-phm update
-```
-
-> **Note:** Run `phm update` before installing packages to ensure you have the latest package information.
-
----
-
 ## Version Management
 
 ### use
@@ -254,7 +243,7 @@ phm use 8.5 --system
 
 ### ext
 
-Manage PHP extensions (enable/disable) for CLI and FPM SAPIs.
+Manage PHP extensions (enable/disable).
 
 ```bash
 phm ext <action> [extension] [flags]
@@ -272,7 +261,6 @@ phm ext <action> [extension] [flags]
 
 | Flag | Description |
 |------|-------------|
-| `--sapi <sapi>` | SAPI to affect: `cli`, `fpm`, or `all` (default: `all`) |
 | `--version <ver>` | PHP version (default: current default version) |
 
 **Examples:**
@@ -284,14 +272,11 @@ phm ext list
 # List extensions for PHP 8.5
 phm ext list --version=8.5
 
-# Enable opcache for all SAPIs
-phm ext enable opcache
+# Enable redis
+phm ext enable redis
 
-# Enable xdebug for CLI only
-phm ext enable xdebug --sapi=cli
-
-# Disable xdebug for FPM only
-phm ext disable xdebug --sapi=fpm
+# Disable xdebug
+phm ext disable xdebug
 
 # Enable redis for specific PHP version
 phm ext enable redis --version=8.4

@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	version = "0.1.0"
+	version = "0.2.0"
 	cfg     *config.Config
 )
 
@@ -41,7 +41,6 @@ func main() {
 		newRemoveCmd(),
 		newListCmd(),
 		newSearchCmd(),
-		newUpdateCmd(),
 		newUpgradeCmd(),
 		newInfoCmd(),
 		newUseCmd(),
@@ -117,17 +116,6 @@ func newSearchCmd() *cobra.Command {
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runSearch(args[0])
-		},
-	}
-	return cmd
-}
-
-func newUpdateCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "update",
-		Short: "Update package index",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return runUpdate()
 		},
 	}
 	return cmd
@@ -244,7 +232,7 @@ Examples:
 	return cmd
 }
 
-// getRepo creates and initializes repository
+// getRepo creates and initializes repository with fresh index
 func getRepo() (*repo.Repository, error) {
 	// If --repo is set, enable offline mode
 	if cfg.RepoPath != "" {
@@ -252,14 +240,28 @@ func getRepo() (*repo.Repository, error) {
 	}
 
 	r := repo.New(cfg)
-	if err := r.LoadIndex(); err != nil {
-		// If index doesn't exist, try to fetch it automatically
-		fmt.Printf("\033[34m==>\033[0m Package index not found, fetching...\n")
-		if fetchErr := r.FetchIndex(); fetchErr != nil {
-			return nil, fmt.Errorf("failed to fetch index: %w\n\nRun 'phm update' to download the package index", fetchErr)
+
+	// In offline mode, just load local index
+	if cfg.Offline {
+		if err := r.LoadIndex(); err != nil {
+			return nil, fmt.Errorf("failed to load index: %w", err)
 		}
-		fmt.Printf("\033[32m[OK]\033[0m Package index updated\n\n")
+		return r, nil
 	}
+
+	// Always fetch fresh index (auto-sync)
+	fmt.Printf("\033[34m==>\033[0m Syncing package index...\n")
+	if err := r.FetchIndex(); err != nil {
+		// Fall back to cached index if available
+		if loadErr := r.LoadIndex(); loadErr != nil {
+			return nil, fmt.Errorf("failed to fetch index: %w", err)
+		}
+		fmt.Printf("\033[33m[!]\033[0m Using cached index (fetch failed: %v)\n", err)
+	} else {
+		fmt.Printf("\033[32m[OK]\033[0m Package index synced\n")
+	}
+	fmt.Println()
+
 	return r, nil
 }
 
@@ -275,14 +277,10 @@ func getLinker() *pkg.Linker {
 
 // Command implementations
 func runInstall(packages []string, force bool) error {
-	// Always update index before install
-	fmt.Println("\033[34m==>\033[0m Updating package index...")
-	r := repo.New(cfg)
-	if err := r.FetchIndex(); err != nil {
-		return fmt.Errorf("failed to update index: %w", err)
+	r, err := getRepo()
+	if err != nil {
+		return err
 	}
-	fmt.Println("\033[32m[OK]\033[0m Package index updated")
-	fmt.Println()
 
 	mgr := getManager()
 	if err := mgr.LoadInstalled(); err != nil {
@@ -332,8 +330,53 @@ func runInstall(packages []string, force bool) error {
 		return nil
 	}
 
+	// Auto-upgrade: Check if any installed packages of the same PHP version need upgrading
+	var packagesToUpgrade []pkg.Package
+	for phpVer := range installedVersions {
+		prefix := "php" + phpVer + "-"
+		installedPkgs := mgr.GetInstalledByPrefix("php" + phpVer)
+		for _, installed := range installedPkgs {
+			// Skip packages we're about to install (they'll be upgraded anyway)
+			if seenPackages[installed.Name] {
+				continue
+			}
+			// Check if upgrade is available
+			if available := r.GetPackage(installed.Name); available != nil {
+				if pkg.CompareVersions(available.Version, installed.Version) > 0 {
+					packagesToUpgrade = append(packagesToUpgrade, *available)
+				}
+			}
+		}
+		_ = prefix // silence unused warning
+	}
+
+	// Perform auto-upgrade if needed
+	if len(packagesToUpgrade) > 0 {
+		fmt.Printf("\033[34m==>\033[0m Auto-upgrading %d installed package(s) to ensure compatibility...\n", len(packagesToUpgrade))
+		for _, p := range packagesToUpgrade {
+			installed := mgr.GetInstalled(p.Name)
+			fmt.Printf("    %s: %s -> %s\n", p.Name, installed.Version, p.Version)
+		}
+		fmt.Println()
+
+		for _, p := range packagesToUpgrade {
+			fmt.Printf("\033[34m==>\033[0m Upgrading %s to %s...\n", p.Name, p.Version)
+			path, err := r.DownloadPackage(&p)
+			if err != nil {
+				fmt.Printf("\033[31mError:\033[0m Failed to download %s: %v\n", p.Name, err)
+				continue
+			}
+			if _, err := mgr.Install(path); err != nil {
+				fmt.Printf("\033[31mError:\033[0m Failed to upgrade %s: %v\n", p.Name, err)
+				continue
+			}
+			fmt.Printf("\033[32m[OK]\033[0m %s upgraded\n", p.Name)
+		}
+		fmt.Println()
+	}
+
 	// Show installation plan
-	fmt.Printf("\n\033[1mThe following packages will be installed:\033[0m\n")
+	fmt.Printf("\033[1mThe following packages will be installed:\033[0m\n")
 	for _, p := range allToInstall {
 		status := ""
 		if mgr.IsInstalled(p.Name) {
@@ -700,18 +743,6 @@ func runSearch(query string) error {
 	}
 
 	fmt.Printf("Found %d package(s)\n", len(results))
-	return nil
-}
-
-func runUpdate() error {
-	fmt.Println("\033[34m==>\033[0m Updating package index...")
-
-	r := repo.New(cfg)
-	if err := r.FetchIndex(); err != nil {
-		return fmt.Errorf("failed to update index: %w", err)
-	}
-
-	fmt.Println("\033[32m[OK]\033[0m Package index updated")
 	return nil
 }
 
@@ -1247,61 +1278,50 @@ func runExtList(extMgr *pkg.ExtensionManager, version string) error {
 	fmt.Printf("\n\033[1mPHP %s Extensions\033[0m\n\n", version)
 
 	if len(extensions) == 0 {
-		fmt.Println("  No extensions found in mods-available")
+		fmt.Println("  No extensions found")
 		return nil
 	}
 
-	fmt.Printf("  \033[1m%-20s %-10s %-10s\033[0m\n", "Extension", "CLI", "FPM")
-	fmt.Printf("  %-20s %-10s %-10s\n", strings.Repeat("-", 20), strings.Repeat("-", 10), strings.Repeat("-", 10))
+	fmt.Printf("  \033[1m%-20s %-10s\033[0m\n", "Extension", "Status")
+	fmt.Printf("  %-20s %-10s\n", strings.Repeat("-", 20), strings.Repeat("-", 10))
 
 	for _, ext := range extensions {
-		cliStatus := "\033[31mdisabled\033[0m"
-		if ext.EnabledCLI {
-			cliStatus = "\033[32menabled\033[0m"
+		status := "\033[31mdisabled\033[0m"
+		if ext.Enabled {
+			status = "\033[32menabled\033[0m"
 		}
 
-		fpmStatus := "\033[31mdisabled\033[0m"
-		if ext.EnabledFPM {
-			fpmStatus = "\033[32menabled\033[0m"
-		}
-
-		fmt.Printf("  %-20s %-19s %-19s\n", ext.Name, cliStatus, fpmStatus)
+		fmt.Printf("  %-20s %-19s\n", ext.Name, status)
 	}
 
-	fmt.Printf("\n  Enable with:  phm ext enable <extension> [--sapi=cli|fpm|all]\n")
-	fmt.Printf("  Disable with: phm ext disable <extension> [--sapi=cli|fpm|all]\n")
+	fmt.Printf("\n  Enable with:  phm ext enable <extension>\n")
+	fmt.Printf("  Disable with: phm ext disable <extension>\n")
 
 	return nil
 }
 
 func runExtEnable(extMgr *pkg.ExtensionManager, version, extension, sapi string) error {
-	fmt.Printf("\033[34m==>\033[0m Enabling %s for %s (PHP %s)...\n", extension, sapi, version)
+	fmt.Printf("\033[34m==>\033[0m Enabling %s (PHP %s)...\n", extension, version)
 
 	if err := extMgr.Enable(version, extension, sapi); err != nil {
 		return err
 	}
 
 	fmt.Printf("\033[32m[OK]\033[0m %s enabled\n", extension)
-
-	if sapi == "fpm" || sapi == "all" {
-		fmt.Printf("\n\033[33mNote:\033[0m Restart PHP-FPM to apply changes: phm fpm restart %s\n", version)
-	}
+	fmt.Printf("\n\033[33mNote:\033[0m Restart PHP-FPM to apply changes: phm fpm restart %s\n", version)
 
 	return nil
 }
 
 func runExtDisable(extMgr *pkg.ExtensionManager, version, extension, sapi string) error {
-	fmt.Printf("\033[34m==>\033[0m Disabling %s for %s (PHP %s)...\n", extension, sapi, version)
+	fmt.Printf("\033[34m==>\033[0m Disabling %s (PHP %s)...\n", extension, version)
 
 	if err := extMgr.Disable(version, extension, sapi); err != nil {
 		return err
 	}
 
 	fmt.Printf("\033[32m[OK]\033[0m %s disabled\n", extension)
-
-	if sapi == "fpm" || sapi == "all" {
-		fmt.Printf("\n\033[33mNote:\033[0m Restart PHP-FPM to apply changes: phm fpm restart %s\n", version)
-	}
+	fmt.Printf("\n\033[33mNote:\033[0m Restart PHP-FPM to apply changes: phm fpm restart %s\n", version)
 
 	return nil
 }

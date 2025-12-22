@@ -11,6 +11,7 @@ import (
 
 	"github.com/phm-dev/phm/internal/config"
 	"github.com/phm-dev/phm/internal/pkg"
+	"github.com/schollz/progressbar/v3"
 )
 
 // Repository handles package index and downloads
@@ -149,7 +150,7 @@ func (r *Repository) SearchPackages(query string) []pkg.Package {
 	return results
 }
 
-// DownloadPackage downloads a package to cache
+// DownloadPackage downloads a package to cache with progress bar
 func (r *Repository) DownloadPackage(p *pkg.Package) (string, error) {
 	filename := fmt.Sprintf("%s_%s-%d_%s.tar.zst", p.Name, p.Version, p.Revision, p.Platform)
 
@@ -195,7 +196,27 @@ func (r *Repository) DownloadPackage(p *pkg.Package) (string, error) {
 	}
 	defer out.Close()
 
-	if _, err := io.Copy(out, resp.Body); err != nil {
+	// Create progress bar
+	bar := progressbar.NewOptions64(
+		resp.ContentLength,
+		progressbar.OptionSetDescription("    Downloading"),
+		progressbar.OptionSetWidth(30),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "█",
+			SaucerHead:    "█",
+			SaucerPadding: "░",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Println()
+		}),
+	)
+
+	// Copy with progress
+	if _, err := io.Copy(io.MultiWriter(out, bar), resp.Body); err != nil {
 		os.Remove(cachePath)
 		return "", err
 	}

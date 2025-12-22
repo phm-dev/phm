@@ -16,11 +16,9 @@ type ExtensionManager struct {
 
 // ExtensionStatus represents the status of an extension
 type ExtensionStatus struct {
-	Name       string
-	Available  bool
-	EnabledCLI bool
-	EnabledFPM bool
-	IniFile    string
+	Name    string
+	Enabled bool
+	IniFile string
 }
 
 // NewExtensionManager creates a new extension manager
@@ -30,50 +28,86 @@ func NewExtensionManager(installPrefix string) *ExtensionManager {
 	}
 }
 
-// getModsDir returns the mods-available directory for a PHP version
-func (e *ExtensionManager) getModsDir(version string) string {
-	return filepath.Join(e.installPrefix, version, "etc", "mods-available")
+// getConfDir returns the conf.d directory for a PHP version
+// PHP scans this directory for additional ini files
+func (e *ExtensionManager) getConfDir(version string) string {
+	return filepath.Join(e.installPrefix, version, "etc", "conf.d")
 }
 
-// getConfDir returns the conf.d directory for a SAPI
-func (e *ExtensionManager) getConfDir(version, sapi string) string {
-	return filepath.Join(e.installPrefix, version, "etc", sapi, "conf.d")
-}
-
-// ListExtensions returns all available extensions and their status
-func (e *ExtensionManager) ListExtensions(version string) ([]ExtensionStatus, error) {
-	modsDir := e.getModsDir(version)
-
-	entries, err := os.ReadDir(modsDir)
+// getExtensionDir returns the directory where .so files are stored
+func (e *ExtensionManager) getExtensionDir(version string) string {
+	// Find the actual extension directory
+	baseDir := filepath.Join(e.installPrefix, version, "lib", "php", "extensions")
+	entries, err := os.ReadDir(baseDir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("PHP %s is not installed or has no extensions", version)
+		return ""
+	}
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), "no-debug-") {
+			return filepath.Join(baseDir, entry.Name())
 		}
-		return nil, err
+	}
+	return baseDir
+}
+
+// ListExtensions returns all extensions and their status
+func (e *ExtensionManager) ListExtensions(version string) ([]ExtensionStatus, error) {
+	confDir := e.getConfDir(version)
+	extDir := e.getExtensionDir(version)
+
+	if extDir == "" {
+		return nil, fmt.Errorf("PHP %s extension directory not found", version)
+	}
+
+	// Get all .so files from extension directory
+	soFiles, err := os.ReadDir(extDir)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read extension directory: %w", err)
+	}
+
+	// Get enabled extensions from conf.d
+	enabledExts := make(map[string]string) // extension name -> ini file
+	if entries, err := os.ReadDir(confDir); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".ini") {
+				extName := e.extractExtensionName(entry.Name())
+				enabledExts[extName] = entry.Name()
+			}
+		}
 	}
 
 	var extensions []ExtensionStatus
+	seen := make(map[string]bool)
 
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".ini") {
+	// List all available .so extensions
+	for _, entry := range soFiles {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".so") {
 			continue
 		}
 
-		name := strings.TrimSuffix(entry.Name(), ".ini")
-		// Remove priority prefix if present (e.g., "10-opcache.ini" -> "opcache")
-		if idx := strings.Index(name, "-"); idx > 0 && idx < 3 {
-			name = name[idx+1:]
+		name := strings.TrimSuffix(entry.Name(), ".so")
+		if seen[name] {
+			continue
 		}
+		seen[name] = true
 
-		status := ExtensionStatus{
-			Name:       name,
-			Available:  true,
-			IniFile:    entry.Name(),
-			EnabledCLI: e.isEnabled(version, "cli", entry.Name()),
-			EnabledFPM: e.isEnabled(version, "fpm", entry.Name()),
+		iniFile, enabled := enabledExts[name]
+		extensions = append(extensions, ExtensionStatus{
+			Name:    name,
+			Enabled: enabled,
+			IniFile: iniFile,
+		})
+	}
+
+	// Also add any enabled extensions that might not have .so visible
+	for extName, iniFile := range enabledExts {
+		if !seen[extName] {
+			extensions = append(extensions, ExtensionStatus{
+				Name:    extName,
+				Enabled: true,
+				IniFile: iniFile,
+			})
 		}
-
-		extensions = append(extensions, status)
 	}
 
 	sort.Slice(extensions, func(i, j int) bool {
@@ -83,145 +117,109 @@ func (e *ExtensionManager) ListExtensions(version string) ([]ExtensionStatus, er
 	return extensions, nil
 }
 
-// isEnabled checks if an extension is enabled for a SAPI
-func (e *ExtensionManager) isEnabled(version, sapi, iniFile string) bool {
-	confDir := e.getConfDir(version, sapi)
-	linkPath := filepath.Join(confDir, iniFile)
-	_, err := os.Lstat(linkPath)
-	return err == nil
+// extractExtensionName extracts extension name from ini filename
+// e.g., "20-redis.ini" -> "redis", "opcache.ini" -> "opcache"
+func (e *ExtensionManager) extractExtensionName(filename string) string {
+	name := strings.TrimSuffix(filename, ".ini")
+	// Remove priority prefix if present (e.g., "20-redis" -> "redis")
+	if idx := strings.Index(name, "-"); idx > 0 && idx <= 2 {
+		name = name[idx+1:]
+	}
+	return name
 }
 
-// Enable enables an extension for a SAPI
+// Enable enables an extension
 func (e *ExtensionManager) Enable(version, extension, sapi string) error {
-	modsDir := e.getModsDir(version)
+	confDir := e.getConfDir(version)
+	extDir := e.getExtensionDir(version)
 
-	// Find the ini file
-	iniFile, err := e.findIniFile(modsDir, extension)
-	if err != nil {
-		return err
+	// Check if .so file exists
+	soPath := filepath.Join(extDir, extension+".so")
+	if _, err := os.Stat(soPath); os.IsNotExist(err) {
+		return fmt.Errorf("extension '%s' not found (no %s.so in %s)", extension, extension, extDir)
 	}
-
-	// Handle "all" sapi
-	sapis := []string{sapi}
-	if sapi == "all" {
-		sapis = []string{"cli", "fpm"}
-	}
-
-	for _, s := range sapis {
-		if err := e.enableForSapi(version, s, iniFile); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// enableForSapi enables an extension for a specific SAPI
-func (e *ExtensionManager) enableForSapi(version, sapi, iniFile string) error {
-	modsDir := e.getModsDir(version)
-	confDir := e.getConfDir(version, sapi)
 
 	// Ensure conf.d directory exists
 	if err := os.MkdirAll(confDir, 0755); err != nil {
 		cmd := exec.Command("sudo", "mkdir", "-p", confDir)
 		if runErr := cmd.Run(); runErr != nil {
-			return fmt.Errorf("failed to create config dir %s: %v: %w", confDir, err, runErr)
+			return fmt.Errorf("failed to create config dir: %w", runErr)
 		}
 	}
 
-	sourcePath := filepath.Join(modsDir, iniFile)
-	linkPath := filepath.Join(confDir, iniFile)
-
 	// Check if already enabled
-	if _, err := os.Lstat(linkPath); err == nil {
+	iniFile := "20-" + extension + ".ini"
+	iniPath := filepath.Join(confDir, iniFile)
+	if _, err := os.Stat(iniPath); err == nil {
 		return nil // Already enabled
 	}
 
-	// Create symlink
-	if err := os.Symlink(sourcePath, linkPath); err != nil {
+	// Create ini file
+	var content string
+	if extension == "opcache" {
+		content = "zend_extension=opcache.so\n"
+	} else {
+		content = fmt.Sprintf("extension=%s.so\n", extension)
+	}
+
+	if err := os.WriteFile(iniPath, []byte(content), 0644); err != nil {
 		// Try with sudo
-		cmd := exec.Command("sudo", "ln", "-sf", sourcePath, linkPath)
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to enable %s for %s: %w", iniFile, sapi, err)
+		tmpFile := filepath.Join(os.TempDir(), iniFile)
+		if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+			return fmt.Errorf("failed to create ini file: %w", err)
 		}
+		cmd := exec.Command("sudo", "cp", tmpFile, iniPath)
+		if err := cmd.Run(); err != nil {
+			os.Remove(tmpFile)
+			return fmt.Errorf("failed to enable %s: %w", extension, err)
+		}
+		os.Remove(tmpFile)
 	}
 
 	return nil
 }
 
-// Disable disables an extension for a SAPI
+// Disable disables an extension
 func (e *ExtensionManager) Disable(version, extension, sapi string) error {
-	modsDir := e.getModsDir(version)
+	confDir := e.getConfDir(version)
 
-	// Find the ini file
-	iniFile, err := e.findIniFile(modsDir, extension)
+	// Find the ini file for this extension
+	entries, err := os.ReadDir(confDir)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // conf.d doesn't exist, nothing to disable
+		}
 		return err
 	}
 
-	// Handle "all" sapi
-	sapis := []string{sapi}
-	if sapi == "all" {
-		sapis = []string{"cli", "fpm"}
-	}
-
-	for _, s := range sapis {
-		if err := e.disableForSapi(version, s, iniFile); err != nil {
-			return err
+	var iniPath string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		extName := e.extractExtensionName(entry.Name())
+		if extName == extension {
+			iniPath = filepath.Join(confDir, entry.Name())
+			break
 		}
 	}
 
-	return nil
-}
-
-// disableForSapi disables an extension for a specific SAPI
-func (e *ExtensionManager) disableForSapi(version, sapi, iniFile string) error {
-	confDir := e.getConfDir(version, sapi)
-	linkPath := filepath.Join(confDir, iniFile)
-
-	// Check if enabled
-	if _, err := os.Lstat(linkPath); os.IsNotExist(err) {
-		return nil // Already disabled
+	if iniPath == "" {
+		return nil // Not enabled, nothing to do
 	}
 
-	// Remove symlink
-	if err := os.Remove(linkPath); err != nil {
-		cmd := exec.Command("sudo", "rm", "-f", linkPath)
+	// Remove ini file
+	if err := os.Remove(iniPath); err != nil {
+		cmd := exec.Command("sudo", "rm", "-f", iniPath)
 		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to disable %s for %s: %w", iniFile, sapi, err)
+			return fmt.Errorf("failed to disable %s: %w", extension, err)
 		}
 	}
 
 	return nil
 }
 
-// findIniFile finds the ini file for an extension in mods-available
-func (e *ExtensionManager) findIniFile(modsDir, extension string) (string, error) {
-	entries, err := os.ReadDir(modsDir)
-	if err != nil {
-		return "", err
-	}
-
-	// First try exact match
-	exactMatch := extension + ".ini"
-	for _, entry := range entries {
-		if entry.Name() == exactMatch {
-			return exactMatch, nil
-		}
-	}
-
-	// Try with priority prefix (e.g., "10-opcache.ini")
-	for _, entry := range entries {
-		name := entry.Name()
-		if strings.HasSuffix(name, "-"+extension+".ini") {
-			return name, nil
-		}
-	}
-
-	return "", fmt.Errorf("extension '%s' not found in %s", extension, modsDir)
-}
-
-// GetInstalledVersions returns all PHP versions that have the extension structure
+// GetInstalledVersions returns all PHP versions that have extensions
 func (e *ExtensionManager) GetInstalledVersions() []string {
 	var versions []string
 
@@ -235,10 +233,10 @@ func (e *ExtensionManager) GetInstalledVersions() []string {
 			continue
 		}
 		name := entry.Name()
-		// Check if it's a version directory
+		// Check if it's a version directory (e.g., "8.5")
 		if len(name) >= 3 && name[0] >= '0' && name[0] <= '9' {
-			modsDir := e.getModsDir(name)
-			if _, err := os.Stat(modsDir); err == nil {
+			confDir := e.getConfDir(name)
+			if _, err := os.Stat(filepath.Dir(confDir)); err == nil {
 				versions = append(versions, name)
 			}
 		}

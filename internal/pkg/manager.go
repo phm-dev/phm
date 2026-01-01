@@ -265,8 +265,25 @@ func compareVersions(a, b string) int {
 	return 0
 }
 
-// Install installs a package from a tarball
+// InstallOptions contains options for package installation
+type InstallOptions struct {
+	// InstallSlot is the target directory slot (e.g., "8.5" or "8.5.1")
+	// If empty, uses the default from the tarball
+	InstallSlot string
+	// Pinned marks the package as pinned (won't be upgraded)
+	Pinned bool
+	// CustomName overrides the package name in the database
+	// Used for pinned versions: php8.5.1-cli vs php8.5-cli
+	CustomName string
+}
+
+// Install installs a package from a tarball with default options
 func (m *Manager) Install(pkgPath string) (*InstalledPackage, error) {
+	return m.InstallWithOptions(pkgPath, InstallOptions{})
+}
+
+// InstallWithOptions installs a package from a tarball with custom options
+func (m *Manager) InstallWithOptions(pkgPath string, opts InstallOptions) (*InstalledPackage, error) {
 	// Open tarball
 	f, err := os.Open(pkgPath)
 	if err != nil {
@@ -284,6 +301,7 @@ func (m *Manager) Install(pkgPath string) (*InstalledPackage, error) {
 
 	var pkgInfo Package
 	var installedFiles []string
+	var sourceSlot string // The original install slot from tarball (e.g., "8.5")
 
 	for {
 		header, err := tr.Next()
@@ -303,6 +321,10 @@ func (m *Manager) Install(pkgPath string) (*InstalledPackage, error) {
 			if err := json.Unmarshal(data, &pkgInfo); err != nil {
 				return nil, err
 			}
+			// Detect source slot from package version (e.g., "8.5.0" -> "8.5")
+			if parts := strings.Split(pkgInfo.Version, "."); len(parts) >= 2 {
+				sourceSlot = parts[0] + "." + parts[1]
+			}
 
 		default:
 			if strings.HasPrefix(header.Name, "files/") {
@@ -312,6 +334,17 @@ func (m *Manager) Install(pkgPath string) (*InstalledPackage, error) {
 				}
 
 				destPath := "/" + relPath
+
+				// Rewrite path if installing to a different slot
+				// e.g., /opt/php/8.5/bin/php -> /opt/php/8.5.1/bin/php
+				if opts.InstallSlot != "" && sourceSlot != "" && opts.InstallSlot != sourceSlot {
+					oldPrefix := "/opt/php/" + sourceSlot + "/"
+					newPrefix := "/opt/php/" + opts.InstallSlot + "/"
+					if strings.HasPrefix(destPath, oldPrefix) {
+						destPath = newPrefix + strings.TrimPrefix(destPath, oldPrefix)
+					}
+				}
+
 				destDir := filepath.Dir(destPath)
 
 				// Create directory
@@ -356,18 +389,34 @@ func (m *Manager) Install(pkgPath string) (*InstalledPackage, error) {
 		}
 	}
 
+	// Determine the actual install slot
+	installSlot := sourceSlot
+	if opts.InstallSlot != "" {
+		installSlot = opts.InstallSlot
+	}
+
+	// Determine package name for database
+	pkgName := pkgInfo.Name
+	if opts.CustomName != "" {
+		pkgName = opts.CustomName
+	}
+
 	// Create installed package record
 	installed := &InstalledPackage{
 		Package:        pkgInfo,
 		InstalledFiles: installedFiles,
+		InstallSlot:    installSlot,
+		Pinned:         opts.Pinned,
 	}
+	// Override name if custom name provided
+	installed.Name = pkgName
 
 	// Save to database
 	if err := m.saveInstalled(installed); err != nil {
 		return nil, err
 	}
 
-	m.installed[pkgInfo.Name] = installed
+	m.installed[pkgName] = installed
 	return installed, nil
 }
 
@@ -466,6 +515,11 @@ func (m *Manager) GetAllInstalled() []*InstalledPackage {
 func (m *Manager) CheckUpgrade(name string, availableVersion string) string {
 	installed := m.GetInstalled(name)
 	if installed == nil {
+		return ""
+	}
+
+	// Don't upgrade pinned packages (installed with specific patch version like php8.5.1-cli)
+	if installed.Pinned {
 		return ""
 	}
 

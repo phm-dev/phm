@@ -43,9 +43,56 @@ phm use <version>        # Set default PHP version
 phm fpm start|stop|...   # Manage PHP-FPM service
 phm ext enable|disable   # Manage extensions
 phm ui                   # Interactive wizard
+phm self-update          # Update PHM to latest version
 ```
 
-**[Full Commands Reference](docs/commands.md)** - detailed documentation for all commands with examples.
+## Version Pinning
+
+PHM supports two installation modes for precise version control:
+
+### Track Latest (Recommended)
+
+Install using minor version - automatically receives patch updates:
+
+```bash
+phm install php8.5-cli php8.5-fpm
+```
+
+- Installs to `/opt/php/8.5/`
+- `phm upgrade` updates to latest patch (e.g., 8.5.0 → 8.5.2)
+- Best for development environments
+
+### Pin Specific Version
+
+Install using full version - stays on exact version:
+
+```bash
+phm install php8.5.1-cli php8.5.1-fpm
+```
+
+- Installs to `/opt/php/8.5.1/`
+- `phm upgrade` will NOT update this installation
+- Useful for reproducing specific environments
+
+### Running Multiple Versions
+
+You can have both tracking and pinned versions simultaneously:
+
+```bash
+# Install latest 8.5.x (tracking)
+phm install php8.5-cli
+
+# Install pinned 8.5.0 for legacy testing
+phm install php8.5.0-cli
+
+# Switch between them
+phm use 8.5      # Use latest (currently 8.5.2)
+phm use 8.5.0    # Use pinned version
+```
+
+After `phm upgrade`:
+- `/opt/php/8.5/` → updated to 8.5.2
+- `/opt/php/8.5.0/` → stays at 8.5.0
 
 ---
 

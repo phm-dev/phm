@@ -44,8 +44,58 @@ phm search <fraza>       # Szukaj pakietów
 phm info <pakiet>        # Pokaż szczegóły pakietu
 phm use <wersja>         # Ustaw domyślną wersję PHP
 phm fpm start|stop|...   # Zarządzaj usługą PHP-FPM
+phm ext enable|disable   # Zarządzaj rozszerzeniami
 phm ui                   # Interaktywny kreator
+phm self-update          # Aktualizuj PHM do najnowszej wersji
 ```
+
+## Przypinanie wersji
+
+PHM obsługuje dwa tryby instalacji dla precyzyjnej kontroli wersji:
+
+### Śledzenie najnowszej (zalecane)
+
+Instalacja używając wersji minor - automatycznie otrzymuje aktualizacje patch:
+
+```bash
+phm install php8.5-cli php8.5-fpm
+```
+
+- Instaluje do `/opt/php/8.5/`
+- `phm upgrade` aktualizuje do najnowszego patcha (np. 8.5.0 → 8.5.2)
+- Najlepsze dla środowisk deweloperskich
+
+### Przypięcie konkretnej wersji
+
+Instalacja używając pełnej wersji - pozostaje na dokładnej wersji:
+
+```bash
+phm install php8.5.1-cli php8.5.1-fpm
+```
+
+- Instaluje do `/opt/php/8.5.1/`
+- `phm upgrade` NIE zaktualizuje tej instalacji
+- Przydatne do odtworzenia konkretnych środowisk
+
+### Uruchamianie wielu wersji
+
+Możesz mieć jednocześnie wersje śledzone i przypięte:
+
+```bash
+# Zainstaluj najnowszą 8.5.x (śledzona)
+phm install php8.5-cli
+
+# Zainstaluj przypiętą 8.5.0 do testów legacy
+phm install php8.5.0-cli
+
+# Przełączaj między nimi
+phm use 8.5      # Użyj najnowszej (aktualnie 8.5.2)
+phm use 8.5.0    # Użyj przypiętej wersji
+```
+
+Po `phm upgrade`:
+- `/opt/php/8.5/` → zaktualizowane do 8.5.2
+- `/opt/php/8.5.0/` → pozostaje na 8.5.0
 
 ---
 

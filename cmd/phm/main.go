@@ -1896,8 +1896,8 @@ func runSelfUpdate(force bool) error {
 		return fmt.Errorf("unsupported architecture: %s", arch)
 	}
 
-	// Find the right asset
-	assetName := fmt.Sprintf("phm-%s-darwin-%s.tar.gz", latestVersion, arch)
+	// Find the right asset (tag includes 'v' prefix)
+	assetName := fmt.Sprintf("phm-%s-darwin-%s.tar.gz", release.TagName, arch)
 	var downloadURL string
 	for _, asset := range release.Assets {
 		if asset.Name == assetName {

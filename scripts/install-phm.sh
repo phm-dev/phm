@@ -114,12 +114,7 @@ check_existing() {
     if command -v phm &> /dev/null; then
         local current_version
         current_version=$(phm --version 2>/dev/null | awk '{print $3}')
-        warn "PHM is already installed (version: ${current_version})"
-        read -p "Do you want to upgrade? [y/N] " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            exit 0
-        fi
+        info "PHM ${current_version} is already installed, upgrading..."
     fi
 }
 

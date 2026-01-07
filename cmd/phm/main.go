@@ -578,6 +578,21 @@ func extractPHPVersion(name string) string {
 	return ""
 }
 
+// normalizePackageName converts old-style package names to new canonical names
+// Examples:
+//   - php8.5.0-cli -> php8.5-cli
+//   - php8.5.0-redis6.3.0 -> php8.5-redis
+//   - php8.5-cli -> php8.5-cli (unchanged)
+func normalizePackageName(name string) string {
+	// Match old format: php{major}.{minor}.{patch}-{component}{version}
+	// e.g., php8.5.0-redis6.3.0 or php8.5.0-cli
+	re := regexp.MustCompile(`^php(\d+\.\d+)\.\d+-([a-z]+)[\d.]*$`)
+	if matches := re.FindStringSubmatch(name); len(matches) == 3 {
+		return fmt.Sprintf("php%s-%s", matches[1], matches[2])
+	}
+	return name
+}
+
 // installRequest represents a package installation request with version info
 type installRequest struct {
 	RequestedName string // What user requested (e.g., "php8.5.1-cli")
@@ -1015,9 +1030,10 @@ func runUpgrade(packages []string) error {
 
 	// Find packages with available upgrades
 	type upgrade struct {
-		name       string
-		oldVersion string
-		newVersion string
+		installedName  string // Name in installed DB (e.g., php8.5.0-cli)
+		canonicalName  string // Name in index (e.g., php8.5-cli)
+		oldVersion     string
+		newVersion     string
 	}
 	var upgrades []upgrade
 
@@ -1029,16 +1045,19 @@ func runUpgrade(packages []string) error {
 			continue
 		}
 
-		available := r.GetPackage(name)
+		// Normalize old-style package names to find in index
+		canonicalName := normalizePackageName(name)
+		available := r.GetPackage(canonicalName)
 		if available == nil {
 			continue
 		}
 
-		if newVer := mgr.CheckUpgrade(name, available.Version); newVer != "" {
+		if newVer := mgr.CheckUpgradeWithPHP(name, available.Version, available.PHPVersion); newVer != "" {
 			upgrades = append(upgrades, upgrade{
-				name:       name,
-				oldVersion: installed.Version,
-				newVersion: newVer,
+				installedName:  name,
+				canonicalName:  canonicalName,
+				oldVersion:     installed.Version,
+				newVersion:     newVer,
 			})
 		}
 	}
@@ -1051,7 +1070,7 @@ func runUpgrade(packages []string) error {
 	// Show upgrade plan
 	fmt.Printf("\n\033[1mThe following packages will be upgraded:\033[0m\n")
 	for _, u := range upgrades {
-		fmt.Printf("  %s: %s -> %s\n", u.name, u.oldVersion, u.newVersion)
+		fmt.Printf("  %s: %s -> %s\n", u.canonicalName, u.oldVersion, u.newVersion)
 	}
 	fmt.Printf("\n%d package(s) to upgrade.\n\n", len(upgrades))
 
@@ -1060,7 +1079,7 @@ func runUpgrade(packages []string) error {
 	allAvailable := r.GetPackages()
 
 	for _, u := range upgrades {
-		pkgToInstall := r.GetPackage(u.name)
+		pkgToInstall := r.GetPackage(u.canonicalName)
 		if pkgToInstall == nil {
 			continue
 		}
@@ -1068,15 +1087,37 @@ func runUpgrade(packages []string) error {
 		// Resolve dependencies
 		toInstall, err := mgr.ResolveDependencies(pkgToInstall, allAvailable)
 		if err != nil {
-			fmt.Printf("\033[31mError:\033[0m Failed to resolve dependencies for %s: %v\n", u.name, err)
+			fmt.Printf("\033[31mError:\033[0m Failed to resolve dependencies for %s: %v\n", u.canonicalName, err)
 			continue
 		}
 
 		// Install each package (including dependencies that need upgrade)
 		for _, p := range toInstall {
-			newVer := mgr.CheckUpgrade(p.Name, p.Version)
-			if newVer == "" && mgr.IsInstalled(p.Name) {
-				continue // Already installed and up to date
+			// Check if upgrade needed using normalized name
+			normalizedName := normalizePackageName(p.Name)
+			installedPkg := mgr.GetInstalled(p.Name)
+			if installedPkg == nil {
+				// Try to find with old naming convention
+				for _, inst := range mgr.GetAllInstalled() {
+					if normalizePackageName(inst.Name) == normalizedName {
+						installedPkg = inst
+						break
+					}
+				}
+			}
+			if installedPkg != nil {
+				// Compare extension version first
+				versionCmp := pkg.CompareVersions(p.Version, installedPkg.Version)
+				if versionCmp < 0 {
+					continue // Available version is older
+				}
+				if versionCmp == 0 {
+					// Same extension version - compare PHP version (e.g., 8.5.0 vs 8.5.1)
+					phpCmp := pkg.CompareVersions(p.PHPVersion, installedPkg.PHPVersion)
+					if phpCmp <= 0 {
+						continue // Same or older PHP version
+					}
+				}
 			}
 
 			fmt.Printf("\033[34m==>\033[0m Upgrading %s to %s...\n", p.Name, p.Version)
@@ -1099,7 +1140,7 @@ func runUpgrade(packages []string) error {
 		}
 
 		// Update symlinks if needed
-		phpVersion := extractPHPVersion(u.name)
+		phpVersion := extractPHPVersion(u.installedName)
 		if phpVersion != "" {
 			_ = linker.SetupVersionLinks(phpVersion)
 			if linker.GetDefaultVersion() == phpVersion {

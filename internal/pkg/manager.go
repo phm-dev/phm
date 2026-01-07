@@ -530,6 +530,35 @@ func (m *Manager) CheckUpgrade(name string, availableVersion string) string {
 	return ""
 }
 
+// CheckUpgradeWithPHP checks if upgrade is needed considering both extension and PHP version
+// For extensions, the extension version might be the same but PHP version different (e.g., redis 6.3.0 for PHP 8.5.0 vs 8.5.1)
+func (m *Manager) CheckUpgradeWithPHP(name string, availableVersion string, availablePHPVersion string) string {
+	installed := m.GetInstalled(name)
+	if installed == nil {
+		return ""
+	}
+
+	// Don't upgrade pinned packages
+	if installed.Pinned {
+		return ""
+	}
+
+	// Check extension version first
+	versionCmp := compareVersions(availableVersion, installed.Version)
+	if versionCmp > 0 {
+		return availableVersion
+	}
+
+	// Same extension version - check PHP version (for extensions rebuilt for newer PHP)
+	if versionCmp == 0 && availablePHPVersion != "" && installed.PHPVersion != "" {
+		if compareVersions(availablePHPVersion, installed.PHPVersion) > 0 {
+			return availableVersion
+		}
+	}
+
+	return ""
+}
+
 // CompareVersions compares two version strings (exported wrapper)
 func CompareVersions(a, b string) int {
 	return compareVersions(a, b)

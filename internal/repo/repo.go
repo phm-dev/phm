@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/phm-dev/phm/internal/config"
 	"github.com/phm-dev/phm/internal/pkg"
@@ -36,15 +37,7 @@ func (r *Repository) LoadIndex() error {
 		return r.loadLocalIndex(indexPath)
 	}
 
-	// Try to load from cache first
-	cachedPath := filepath.Join(r.cfg.CacheDir, "index.json")
-	if _, err := os.Stat(cachedPath); err == nil {
-		if err := r.loadLocalIndex(cachedPath); err == nil {
-			return nil
-		}
-	}
-
-	// Fetch from remote
+	// Always fetch fresh index from remote
 	return r.FetchIndex()
 }
 
@@ -70,7 +63,8 @@ func (r *Repository) FetchIndex() error {
 		return r.loadLocalIndex(r.cfg.GetIndexPath())
 	}
 
-	url := r.cfg.RepoURL + "/index.json"
+	// Add timestamp to bypass GitHub's CDN cache
+	url := fmt.Sprintf("%s/index.json?t=%d", r.cfg.RepoURL, time.Now().Unix())
 
 	resp, err := http.Get(url)
 	if err != nil {
@@ -123,15 +117,18 @@ func (r *Repository) GetPackages() []pkg.Package {
 	return nil
 }
 
-// GetPackage returns a specific package by name
+// GetPackage returns a specific package by name (latest version)
 func (r *Repository) GetPackage(name string) *pkg.Package {
 	packages := r.GetPackages()
-	for _, p := range packages {
-		if p.Name == name {
-			return &p
+	var latest *pkg.Package
+	for i := range packages {
+		if packages[i].Name == name {
+			if latest == nil || pkg.CompareVersions(packages[i].Version, latest.Version) > 0 {
+				latest = &packages[i]
+			}
 		}
 	}
-	return nil
+	return latest
 }
 
 // SearchPackages searches packages by query

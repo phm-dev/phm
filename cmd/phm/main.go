@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/phm-dev/phm/internal/config"
@@ -318,8 +319,8 @@ func runInstall(packages []string, force bool) error {
 	// Expand meta-packages (slim/full) before processing
 	packages = expandMetaPackages(packages, allAvailable)
 
-	// Collect all packages to install (with dependencies resolved)
-	var allToInstall []*installRequest
+	// Collect all NEW packages to install (with dependencies resolved)
+	var newPackages []*installRequest
 	seenPackages := make(map[string]bool)
 	installedSlots := make(map[string]bool) // Track install slots (e.g., "8.5", "8.5.1")
 
@@ -369,7 +370,7 @@ func runInstall(packages []string, force bool) error {
 
 			if !seenPackages[depReqName] {
 				seenPackages[depReqName] = true
-				allToInstall = append(allToInstall, &installRequest{
+				newPackages = append(newPackages, &installRequest{
 					RequestedName: depReqName,
 					CanonicalName: p.Name,
 					InstallSlot:   depSlot,
@@ -383,23 +384,33 @@ func runInstall(packages []string, force bool) error {
 		}
 	}
 
-	if len(allToInstall) == 0 {
+	if len(newPackages) == 0 {
 		fmt.Println("No packages to install.")
 		return nil
 	}
 
-	// Auto-upgrade: Check if any installed packages of the same install slot need upgrading
-	// Only for non-pinned slots (minor versions like 8.5)
-	var packagesToUpgrade []*installRequest
+	// MACINTOSH CODE SIGNING FIX:
+	// When adding new packages to an existing PHP installation, we must reinstall ALL
+	// packages for that version to avoid macOS Library Validation issues.
+	// The strategy is:
+	// 1. Collect ALL packages (new + already installed) for affected PHP versions
+	// 2. Download ALL packages in parallel
+	// 3. Install ALL packages using merge strategy (binaries overwrite, configs preserved)
+
+	// Collect ALL packages for affected versions (new + existing)
+	var allToInstall []*installRequest
+	allToInstall = append(allToInstall, newPackages...)
+
 	for slot := range installedSlots {
 		// Skip pinned slots (patch versions like 8.5.1)
 		if strings.Count(slot, ".") >= 2 {
 			continue
 		}
 
-		installedPkgs := mgr.GetInstalledByPrefix("php" + slot)
+		// Get all currently installed packages for this version
+		installedPkgs := mgr.GetInstalledForVersion(slot)
 		for _, installed := range installedPkgs {
-			// Skip packages we're about to install (they'll be upgraded anyway)
+			// Skip if already in the install list
 			if seenPackages[installed.Name] {
 				continue
 			}
@@ -407,96 +418,139 @@ func runInstall(packages []string, force bool) error {
 			if installed.Pinned {
 				continue
 			}
-			// Check if upgrade is available
-			if available := r.GetPackage(installed.Name); available != nil {
-				if pkg.CompareVersions(available.Version, installed.Version) > 0 {
-					packagesToUpgrade = append(packagesToUpgrade, &installRequest{
-						RequestedName: installed.Name,
-						CanonicalName: installed.Name,
-						InstallSlot:   slot,
-						IsPinned:      false,
-						Package:       *available,
-					})
-				}
+
+			// Find the latest available version
+			available := r.GetPackage(installed.Name)
+			if available == nil {
+				continue
 			}
+
+			seenPackages[installed.Name] = true
+			allToInstall = append(allToInstall, &installRequest{
+				RequestedName: installed.Name,
+				CanonicalName: installed.Name,
+				InstallSlot:   slot,
+				IsPinned:      false,
+				Package:       *available,
+			})
 		}
 	}
 
-	// Perform auto-upgrade if needed
-	if len(packagesToUpgrade) > 0 {
-		fmt.Printf("\033[34m==>\033[0m Auto-upgrading %d installed package(s) to ensure compatibility...\n", len(packagesToUpgrade))
-		for _, req := range packagesToUpgrade {
-			installed := mgr.GetInstalled(req.RequestedName)
-			fmt.Printf("    %s: %s -> %s\n", req.RequestedName, installed.Version, req.Package.Version)
+	// Separate packages into new installs vs reinstalls for display
+	var newInstalls, reinstalls []*installRequest
+	for _, req := range allToInstall {
+		isNew := false
+		for _, newPkg := range newPackages {
+			if newPkg.RequestedName == req.RequestedName && !mgr.IsInstalled(req.RequestedName) {
+				isNew = true
+				break
+			}
 		}
-		fmt.Println()
-
-		for _, req := range packagesToUpgrade {
-			fmt.Printf("\033[34m==>\033[0m Upgrading %s to %s...\n", req.RequestedName, req.Package.Version)
-			path, err := r.DownloadPackage(&req.Package)
-			if err != nil {
-				fmt.Printf("\033[31mError:\033[0m Failed to download %s: %v\n", req.RequestedName, err)
-				continue
-			}
-			opts := pkg.InstallOptions{
-				InstallSlot: req.InstallSlot,
-				Pinned:      req.IsPinned,
-				CustomName:  req.RequestedName,
-			}
-			if _, err := mgr.InstallWithOptions(path, opts); err != nil {
-				fmt.Printf("\033[31mError:\033[0m Failed to upgrade %s: %v\n", req.RequestedName, err)
-				continue
-			}
-			fmt.Printf("\033[32m[OK]\033[0m %s upgraded\n", req.RequestedName)
+		if isNew {
+			newInstalls = append(newInstalls, req)
+		} else {
+			reinstalls = append(reinstalls, req)
 		}
-		fmt.Println()
 	}
 
 	// Show installation plan
 	fmt.Printf("\033[1mThe following packages will be installed:\033[0m\n")
-	for _, req := range allToInstall {
-		status := ""
+	for _, req := range newInstalls {
 		location := ""
-		if mgr.IsInstalled(req.RequestedName) {
-			status = " \033[33m(reinstall)\033[0m"
-		}
 		if req.IsPinned {
 			location = fmt.Sprintf(" \033[36m[pinned -> /opt/php/%s]\033[0m", req.InstallSlot)
 		}
-		fmt.Printf("  - %s (%s)%s%s\n", req.RequestedName, req.Package.Version, status, location)
+		fmt.Printf("  \033[32m+\033[0m %s (%s)%s\n", req.RequestedName, req.Package.Version, location)
+	}
+
+	if len(reinstalls) > 0 {
+		fmt.Printf("\n\033[1mThe following packages will be reinstalled (macOS code signing):\033[0m\n")
+		for _, req := range reinstalls {
+			installed := mgr.GetInstalled(req.RequestedName)
+			versionInfo := ""
+			if installed != nil && pkg.CompareVersions(req.Package.Version, installed.Version) > 0 {
+				versionInfo = fmt.Sprintf(" \033[33m%s -> %s\033[0m", installed.Version, req.Package.Version)
+			} else {
+				versionInfo = fmt.Sprintf(" (%s)", req.Package.Version)
+			}
+			fmt.Printf("  \033[34m↻\033[0m %s%s\n", req.RequestedName, versionInfo)
+		}
 	}
 	fmt.Println()
 
-	// Install all packages
-	var installedPkgs []pkg.Package
+	// Download ALL packages in parallel
+	fmt.Printf("\033[34m==>\033[0m Downloading %d package(s) in parallel...\n", len(allToInstall))
+	var pkgsToDownload []*pkg.Package
 	for _, req := range allToInstall {
-		if mgr.IsInstalled(req.RequestedName) && !force {
-			fmt.Printf("\033[33m[SKIP]\033[0m %s already installed\n", req.RequestedName)
+		p := req.Package
+		pkgsToDownload = append(pkgsToDownload, &p)
+	}
+
+	downloadResults := r.DownloadPackagesParallel(pkgsToDownload, 4)
+
+	// Check for download errors
+	var downloadErrors []string
+	for _, result := range downloadResults {
+		if result.Error != nil {
+			downloadErrors = append(downloadErrors, fmt.Sprintf("%s: %v", result.Package.Name, result.Error))
+		}
+	}
+	if len(downloadErrors) > 0 {
+		fmt.Printf("\033[31mError:\033[0m Failed to download packages:\n")
+		for _, e := range downloadErrors {
+			fmt.Printf("  - %s\n", e)
+		}
+		return fmt.Errorf("download failed")
+	}
+	fmt.Printf("\033[32m[OK]\033[0m All packages downloaded\n\n")
+
+	// Install ALL packages using merge strategy
+	var installedPkgs []pkg.Package
+	var upgradedPkgs []pkg.Package
+
+	// Sort packages: common first, then cli, then others (dependency order)
+	sort.Slice(allToInstall, func(i, j int) bool {
+		iPriority := getPackagePriority(allToInstall[i].RequestedName)
+		jPriority := getPackagePriority(allToInstall[j].RequestedName)
+		return iPriority < jPriority
+	})
+
+	for _, req := range allToInstall {
+		result := downloadResults[req.CanonicalName]
+		if result.Path == "" {
+			fmt.Printf("\033[31mError:\033[0m No download path for %s\n", req.RequestedName)
 			continue
+		}
+
+		wasInstalled := mgr.IsInstalled(req.RequestedName)
+		oldVersion := ""
+		if wasInstalled {
+			if old := mgr.GetInstalled(req.RequestedName); old != nil {
+				oldVersion = old.Version
+			}
 		}
 
 		fmt.Printf("\033[34m==>\033[0m Installing %s (%s)...\n", req.RequestedName, req.Package.Version)
 
-		// Download package
-		path, err := r.DownloadPackage(&req.Package)
-		if err != nil {
-			fmt.Printf("\033[31mError:\033[0m Failed to download: %v\n", err)
-			continue
-		}
-
-		// Install package with options
+		// Install package with merge strategy
 		opts := pkg.InstallOptions{
 			InstallSlot: req.InstallSlot,
 			Pinned:      req.IsPinned,
 			CustomName:  req.RequestedName,
 		}
-		_, err = mgr.InstallWithOptions(path, opts)
+		_, err := mgr.InstallWithMerge(result.Path, opts)
 		if err != nil {
 			fmt.Printf("\033[31mError:\033[0m Failed to install: %v\n", err)
 			continue
 		}
 
-		installedPkgs = append(installedPkgs, req.Package)
+		// Track for summary
+		if !wasInstalled {
+			installedPkgs = append(installedPkgs, req.Package)
+		} else if oldVersion != "" && pkg.CompareVersions(req.Package.Version, oldVersion) > 0 {
+			upgradedPkgs = append(upgradedPkgs, req.Package)
+		}
+
 		fmt.Printf("\033[32m[OK]\033[0m %s installed\n", req.RequestedName)
 	}
 
@@ -554,13 +608,33 @@ func runInstall(packages []string, force bool) error {
 	}
 
 	// Print summary
-	var upgradedPkgs []pkg.Package
-	for _, req := range packagesToUpgrade {
-		upgradedPkgs = append(upgradedPkgs, req.Package)
-	}
 	printInstallSummary(installedPkgs, upgradedPkgs, installedSlots, linker)
 
 	return nil
+}
+
+// getPackagePriority returns installation priority (lower = first)
+func getPackagePriority(name string) int {
+	if strings.HasSuffix(name, "-common") {
+		return 0
+	}
+	if strings.HasSuffix(name, "-cli") {
+		return 1
+	}
+	if strings.HasSuffix(name, "-fpm") {
+		return 2
+	}
+	if strings.HasSuffix(name, "-cgi") {
+		return 3
+	}
+	if strings.HasSuffix(name, "-dev") {
+		return 4
+	}
+	if strings.HasSuffix(name, "-pear") {
+		return 5
+	}
+	// Extensions last
+	return 100
 }
 
 // extractPHPVersion extracts PHP version from package name (e.g., "php8.5-cli" -> "8.5", "php8.5.1-cli" -> "8.5.1")

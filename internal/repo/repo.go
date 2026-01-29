@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/phm-dev/phm/internal/config"
@@ -219,4 +220,50 @@ func (r *Repository) DownloadPackage(p *pkg.Package) (string, error) {
 	}
 
 	return cachePath, nil
+}
+
+// DownloadResult holds the result of a parallel download
+type DownloadResult struct {
+	Package *pkg.Package
+	Path    string
+	Error   error
+}
+
+// DownloadPackagesParallel downloads multiple packages concurrently
+// Returns a map of package name -> local path, and any errors
+func (r *Repository) DownloadPackagesParallel(packages []*pkg.Package, maxConcurrent int) map[string]DownloadResult {
+	results := make(map[string]DownloadResult)
+	resultsMutex := sync.Mutex{}
+
+	// Limit concurrency
+	if maxConcurrent <= 0 {
+		maxConcurrent = 4
+	}
+
+	semaphore := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+
+	for _, p := range packages {
+		wg.Add(1)
+		go func(pkg *pkg.Package) {
+			defer wg.Done()
+
+			// Acquire semaphore
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			path, err := r.DownloadPackage(pkg)
+
+			resultsMutex.Lock()
+			results[pkg.Name] = DownloadResult{
+				Package: pkg,
+				Path:    path,
+				Error:   err,
+			}
+			resultsMutex.Unlock()
+		}(p)
+	}
+
+	wg.Wait()
+	return results
 }

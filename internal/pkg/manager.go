@@ -563,3 +563,187 @@ func (m *Manager) CheckUpgradeWithPHP(name string, availableVersion string, avai
 func CompareVersions(a, b string) int {
 	return compareVersions(a, b)
 }
+
+// isBinaryPath checks if the path is a binary file that should always be overwritten
+// Returns true for executables and shared libraries, false for config files
+func isBinaryPath(relPath string) bool {
+	// Config files - don't overwrite if exists
+	if strings.Contains(relPath, "/etc/") {
+		return false
+	}
+
+	// Binary directories - always overwrite
+	if strings.Contains(relPath, "/bin/") ||
+		strings.Contains(relPath, "/sbin/") ||
+		strings.Contains(relPath, "/lib/") ||
+		strings.Contains(relPath, "/libexec/") {
+		return true
+	}
+
+	// Extensions (.so files) - always overwrite
+	if strings.HasSuffix(relPath, ".so") {
+		return true
+	}
+
+	// Default: treat as binary (overwrite)
+	return true
+}
+
+// InstallWithMerge installs a package using merge strategy:
+// - Binary files (bin/, sbin/, lib/, *.so) are always overwritten
+// - Config files (etc/) are only written if they don't exist
+// This solves macOS code signing issues when adding extensions to existing PHP installation
+func (m *Manager) InstallWithMerge(pkgPath string, opts InstallOptions) (*InstalledPackage, error) {
+	// Open tarball
+	f, err := os.Open(pkgPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	zr, err := zstd.NewReader(f)
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+
+	tr := tar.NewReader(zr)
+
+	var pkgInfo Package
+	var installedFiles []string
+	var sourceSlot string
+
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		switch header.Name {
+		case "pkginfo.json":
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				return nil, err
+			}
+			if err := json.Unmarshal(data, &pkgInfo); err != nil {
+				return nil, err
+			}
+			if parts := strings.Split(pkgInfo.Version, "."); len(parts) >= 2 {
+				sourceSlot = parts[0] + "." + parts[1]
+			}
+
+		default:
+			if strings.HasPrefix(header.Name, "files/") {
+				relPath := strings.TrimPrefix(header.Name, "files/")
+				if relPath == "" {
+					continue
+				}
+
+				destPath := "/" + relPath
+
+				// Rewrite path if installing to a different slot
+				if opts.InstallSlot != "" && sourceSlot != "" && opts.InstallSlot != sourceSlot {
+					oldPrefix := "/opt/php/" + sourceSlot + "/"
+					newPrefix := "/opt/php/" + opts.InstallSlot + "/"
+					if strings.HasPrefix(destPath, oldPrefix) {
+						destPath = newPrefix + strings.TrimPrefix(destPath, oldPrefix)
+					}
+				}
+
+				destDir := filepath.Dir(destPath)
+
+				// Create directory
+				if err := os.MkdirAll(destDir, 0755); err != nil {
+					_ = exec.Command("sudo", "mkdir", "-p", destDir).Run()
+				}
+
+				if header.Typeflag == tar.TypeDir {
+					continue
+				}
+
+				// Check merge strategy: skip config files that already exist
+				if !isBinaryPath(destPath) {
+					if _, err := os.Stat(destPath); err == nil {
+						// Config file exists - skip it, preserve user's config
+						installedFiles = append(installedFiles, destPath)
+						continue
+					}
+				}
+
+				// Extract file
+				data, err := io.ReadAll(tr)
+				if err != nil {
+					return nil, err
+				}
+
+				// Replace placeholders in config files
+				if isConfigFile(destPath) {
+					data = replaceConfigPlaceholders(data)
+				}
+
+				// Write file (try directly, then with sudo)
+				if err := os.WriteFile(destPath, data, os.FileMode(header.Mode)); err != nil {
+					tmpFile := filepath.Join(os.TempDir(), filepath.Base(destPath))
+					if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+						return nil, err
+					}
+					cmd := exec.Command("sudo", "cp", tmpFile, destPath)
+					if err := cmd.Run(); err != nil {
+						os.Remove(tmpFile)
+						return nil, fmt.Errorf("failed to install %s: %w", destPath, err)
+					}
+					_ = exec.Command("sudo", "chmod", fmt.Sprintf("%o", header.Mode), destPath).Run()
+					os.Remove(tmpFile)
+				}
+
+				installedFiles = append(installedFiles, destPath)
+			}
+		}
+	}
+
+	// Determine the actual install slot
+	installSlot := sourceSlot
+	if opts.InstallSlot != "" {
+		installSlot = opts.InstallSlot
+	}
+
+	// Determine package name for database
+	pkgName := pkgInfo.Name
+	if opts.CustomName != "" {
+		pkgName = opts.CustomName
+	}
+
+	// Create installed package record
+	installed := &InstalledPackage{
+		Package:        pkgInfo,
+		InstalledFiles: installedFiles,
+		InstallSlot:    installSlot,
+		Pinned:         opts.Pinned,
+	}
+	installed.Name = pkgName
+
+	// Save to database
+	if err := m.saveInstalled(installed); err != nil {
+		return nil, err
+	}
+
+	m.installed[pkgName] = installed
+	return installed, nil
+}
+
+// GetInstalledForVersion returns all installed packages for a specific PHP version slot
+func (m *Manager) GetInstalledForVersion(version string) []*InstalledPackage {
+	var result []*InstalledPackage
+	prefix := "php" + version + "-"
+
+	for _, pkg := range m.installed {
+		if strings.HasPrefix(pkg.Name, prefix) {
+			result = append(result, pkg)
+		}
+	}
+
+	return result
+}

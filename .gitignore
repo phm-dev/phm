@@ -54,3 +54,6 @@ temp/
 # Logs
 *.log
 logs/
+.astro/
+node_modules/
+/phm

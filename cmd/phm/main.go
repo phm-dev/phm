@@ -1,8 +1,7 @@
 package main
 
 import (
-	"archive/tar"
-	"compress/gzip"
+	crypto_sha256 "crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,16 +15,62 @@ import (
 	"strings"
 
 	"github.com/phm-dev/phm/internal/config"
+	"github.com/phm-dev/phm/internal/httputil"
 	"github.com/phm-dev/phm/internal/pkg"
 	"github.com/phm-dev/phm/internal/repo"
-	"github.com/phm-dev/phm/internal/tui"
+	"github.com/phm-dev/phm/internal/tools"
 	"github.com/spf13/cobra"
 )
 
 var (
 	version = "dev" // injected via ldflags during release build
 	cfg     *config.Config
+
+	// Precompiled regexps for package name classification and parsing
+	phpMetaRegex      = regexp.MustCompile(`^php\d+\.\d+(-slim|-full)?$`)
+	phpPackageRegex   = regexp.MustCompile(`^php\d+\.\d+(\.\d+)?-.+`)
+	patchVersionRe    = regexp.MustCompile(`^php(\d+\.\d+\.\d+)`)
+	minorVersionRe    = regexp.MustCompile(`^php(\d+\.\d+)`)
+	oldFormatRegex    = regexp.MustCompile(`^php(\d+\.\d+)\.\d+-([a-z]+)[\d.]*$`)
+	bareVersionRegex  = regexp.MustCompile(`^php(\d+\.\d+)$`)
+	slimMetaRegex     = regexp.MustCompile(`^php(\d+\.\d+)-slim$`)
+	fullMetaRegex     = regexp.MustCompile(`^php(\d+\.\d+)-full$`)
 )
+
+// PackageType represents what kind of package we're dealing with
+type PackageType int
+
+const (
+	TypeUnknown PackageType = iota
+	TypeTool                // composer, symfony, phpstan, etc.
+	TypePHPMeta             // php8.5, php8.5-slim, php8.5-full
+	TypePHPPackage          // php8.5-cli, php8.5-fpm, php8.5-redis
+)
+
+// classifyPackage determines whether a package name is a tool, PHP meta-package, or PHP package
+func classifyPackage(name string) PackageType {
+	// 1. Known tool?
+	if tools.IsKnownTool(name) {
+		return TypeTool
+	}
+
+	// 2. PHP meta-package? (php8.5, php8.5-slim, php8.5-full)
+	if phpMetaRegex.MatchString(name) {
+		return TypePHPMeta
+	}
+
+	// 3. PHP package? (php8.5-cli, php8.5-redis, php8.5.1-cli)
+	if phpPackageRegex.MatchString(name) {
+		return TypePHPPackage
+	}
+
+	return TypeUnknown
+}
+
+// getToolsManager returns a tools manager instance
+func getToolsManager() *tools.Manager {
+	return tools.NewManager(cfg.ToolsPrefix, cfg.ToolsDataDir)
+}
 
 func main() {
 	cfg = config.New()
@@ -33,7 +78,7 @@ func main() {
 	rootCmd := &cobra.Command{
 		Use:     "phm",
 		Short:   "PHM - PHP Manager for macOS",
-		Long:    "A package manager for PHP installations on macOS with TUI interface",
+		Long:    "A package manager for PHP installations and developer tools on macOS",
 		Version: version,
 	}
 
@@ -53,7 +98,6 @@ func main() {
 		newUseCmd(),
 		newFpmCmd(),
 		newExtCmd(),
-		newUICmd(),
 		newConfigCmd(),
 		newDestructCmd(),
 		newSelfUpdateCmd(),
@@ -71,8 +115,20 @@ func newInstallCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "install [packages...]",
 		Aliases: []string{"i"},
-		Short:   "Install packages",
-		Args:    cobra.MinimumNArgs(1),
+		Short:   "Install PHP packages or tools",
+		Long: `Install PHP packages or developer tools.
+
+Supports three types of packages:
+  - PHP packages:     php8.5-cli, php8.5-fpm, php8.5-redis
+  - Meta-packages:    php8.5 (=php8.5-slim), php8.5-slim, php8.5-full
+  - Tools:            composer, symfony, phpstan, php-cs-fixer, psalm, laravel, deployer, castor
+
+Examples:
+  phm install php8.5-cli php8.5-fpm     # Install PHP packages
+  phm install php8.5                     # Install PHP 8.5 (slim meta-package)
+  phm install composer phpstan           # Install developer tools
+  phm install php8.5 composer phpstan    # Install PHP and tools together`,
+		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runInstall(args, force)
 		},
@@ -148,17 +204,6 @@ func newInfoCmd() *cobra.Command {
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runInfo(args[0])
-		},
-	}
-	return cmd
-}
-
-func newUICmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "ui",
-		Short: "Launch interactive TUI",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return tui.Run(cfg)
 		},
 	}
 	return cmd
@@ -298,9 +343,63 @@ func getLinker() *pkg.Linker {
 
 // Command implementations
 func runInstall(packages []string, force bool) error {
+	// Classify packages into tools and PHP packages
+	var toolsToInstall []string
+	var phpPackages []string
+
+	for _, name := range packages {
+		switch classifyPackage(name) {
+		case TypeTool:
+			toolsToInstall = append(toolsToInstall, name)
+		case TypePHPMeta, TypePHPPackage:
+			phpPackages = append(phpPackages, name)
+		default:
+			// Unknown - try as PHP package, will fail later if not found
+			phpPackages = append(phpPackages, name)
+		}
+	}
+
 	// Prompt for sudo password upfront
 	if err := ensureSudo(); err != nil {
 		return err
+	}
+
+	// Acquire exclusive lock to prevent concurrent operations
+	release, err := pkg.AcquireLock(cfg.InstallPrefix)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	// Install tools first (they're independent)
+	if len(toolsToInstall) > 0 {
+		toolsMgr := getToolsManager()
+		if err := toolsMgr.LoadInstalled(); err != nil {
+			if cfg.Debug {
+				fmt.Printf("\033[33mWarning:\033[0m Could not load installed tools: %v\n", err)
+			}
+		}
+
+		var toolErrors []string
+		for _, name := range toolsToInstall {
+			if err := toolsMgr.Install(name, force); err != nil {
+				fmt.Printf("\033[31mError:\033[0m Failed to install %s: %v\n", name, err)
+				toolErrors = append(toolErrors, name)
+			}
+		}
+		fmt.Println()
+
+		if len(phpPackages) == 0 && len(toolErrors) > 0 {
+			return fmt.Errorf("failed to install %d tool(s)", len(toolErrors))
+		}
+	}
+
+	// If no PHP packages to install, we're done
+	if len(phpPackages) == 0 {
+		if len(toolsToInstall) > 0 {
+			fmt.Printf("\033[33mNote:\033[0m Add to your PATH: export PATH=\"%s:$PATH\"\n", cfg.ToolsPrefix)
+		}
+		return nil
 	}
 
 	r, err := getRepo()
@@ -317,7 +416,9 @@ func runInstall(packages []string, force bool) error {
 	allAvailable := r.GetPackages()
 
 	// Expand meta-packages (slim/full) before processing
-	packages = expandMetaPackages(packages, allAvailable)
+	// Also expand bare php8.5 to php8.5-slim
+	phpPackages = expandMetaPackages(phpPackages, allAvailable)
+	packages = phpPackages
 
 	// Collect all NEW packages to install (with dependencies resolved)
 	var newPackages []*installRequest
@@ -402,20 +503,11 @@ func runInstall(packages []string, force bool) error {
 	allToInstall = append(allToInstall, newPackages...)
 
 	for slot := range installedSlots {
-		// Skip pinned slots (patch versions like 8.5.1)
-		if strings.Count(slot, ".") >= 2 {
-			continue
-		}
-
 		// Get all currently installed packages for this version
 		installedPkgs := mgr.GetInstalledForVersion(slot)
 		for _, installed := range installedPkgs {
 			// Skip if already in the install list
 			if seenPackages[installed.Name] {
-				continue
-			}
-			// Skip pinned packages
-			if installed.Pinned {
 				continue
 			}
 
@@ -515,11 +607,24 @@ func runInstall(packages []string, force bool) error {
 		return iPriority < jPriority
 	})
 
+	// Create backups of affected slots for rollback
+	backups := make(map[string]bool)
+	for slot := range installedSlots {
+		slotDir := filepath.Join(cfg.InstallPrefix, slot)
+		backupDir := slotDir + ".bak"
+		_ = exec.Command("sudo", "rm", "-rf", backupDir).Run()
+		if exec.Command("sudo", "cp", "-a", slotDir, backupDir).Run() == nil {
+			backups[slot] = true
+		}
+	}
+
+	var installFailed bool
 	for _, req := range allToInstall {
 		result := downloadResults[req.CanonicalName]
 		if result.Path == "" {
 			fmt.Printf("\033[31mError:\033[0m No download path for %s\n", req.RequestedName)
-			continue
+			installFailed = true
+			break
 		}
 
 		wasInstalled := mgr.IsInstalled(req.RequestedName)
@@ -541,7 +646,8 @@ func runInstall(packages []string, force bool) error {
 		_, err := mgr.InstallWithMerge(result.Path, opts)
 		if err != nil {
 			fmt.Printf("\033[31mError:\033[0m Failed to install: %v\n", err)
-			continue
+			installFailed = true
+			break
 		}
 
 		// Track for summary
@@ -552,6 +658,22 @@ func runInstall(packages []string, force bool) error {
 		}
 
 		fmt.Printf("\033[32m[OK]\033[0m %s installed\n", req.RequestedName)
+	}
+
+	// Rollback or cleanup backups
+	if installFailed {
+		fmt.Printf("\033[31m==>\033[0m Installation failed, rolling back...\n")
+		for slot := range backups {
+			slotDir := filepath.Join(cfg.InstallPrefix, slot)
+			backupDir := slotDir + ".bak"
+			_ = exec.Command("sudo", "rm", "-rf", slotDir).Run()
+			_ = exec.Command("sudo", "mv", backupDir, slotDir).Run()
+		}
+		return fmt.Errorf("installation failed, changes rolled back")
+	}
+	for slot := range backups {
+		backupDir := filepath.Join(cfg.InstallPrefix, slot) + ".bak"
+		_ = exec.Command("sudo", "rm", "-rf", backupDir).Run()
 	}
 
 	// Setup symlinks for all installed slots (once at the end)
@@ -640,13 +762,11 @@ func getPackagePriority(name string) int {
 // extractPHPVersion extracts PHP version from package name (e.g., "php8.5-cli" -> "8.5", "php8.5.1-cli" -> "8.5.1")
 func extractPHPVersion(name string) string {
 	// Try patch version first (e.g., php8.5.1-cli -> 8.5.1)
-	re := regexp.MustCompile(`^php(\d+\.\d+\.\d+)`)
-	if matches := re.FindStringSubmatch(name); len(matches) > 1 {
+	if matches := patchVersionRe.FindStringSubmatch(name); len(matches) > 1 {
 		return matches[1]
 	}
 	// Try minor version (e.g., php8.5-cli -> 8.5)
-	re = regexp.MustCompile(`^php(\d+\.\d+)`)
-	if matches := re.FindStringSubmatch(name); len(matches) > 1 {
+	if matches := minorVersionRe.FindStringSubmatch(name); len(matches) > 1 {
 		return matches[1]
 	}
 	return ""
@@ -660,8 +780,7 @@ func extractPHPVersion(name string) string {
 func normalizePackageName(name string) string {
 	// Match old format: php{major}.{minor}.{patch}-{component}{version}
 	// e.g., php8.5.0-redis6.3.0 or php8.5.0-cli
-	re := regexp.MustCompile(`^php(\d+\.\d+)\.\d+-([a-z]+)[\d.]*$`)
-	if matches := re.FindStringSubmatch(name); len(matches) == 3 {
+	if matches := oldFormatRegex.FindStringSubmatch(name); len(matches) == 3 {
 		return fmt.Sprintf("php%s-%s", matches[1], matches[2])
 	}
 	return name
@@ -793,14 +912,36 @@ func printInstallSummary(installed []pkg.Package, upgraded []pkg.Package, versio
 }
 
 // expandMetaPackages expands meta-packages (slim/full) into real package lists
+// php8.5 -> php8.5-slim (alias)
 // php8.5-slim -> common, cli, fpm, cgi, dev, pear
 // php8.5-full -> slim + all available extensions
 func expandMetaPackages(packages []string, available []pkg.Package) []string {
 	var result []string
 
 	for _, name := range packages {
+		// Check for bare version (e.g., php8.5) - treat as slim
+		if matches := bareVersionRegex.FindStringSubmatch(name); len(matches) > 1 {
+			version := matches[1]
+			slimPkgs := []string{
+				"php" + version + "-common",
+				"php" + version + "-cli",
+				"php" + version + "-fpm",
+				"php" + version + "-cgi",
+				"php" + version + "-dev",
+				"php" + version + "-pear",
+			}
+			// Only add packages that exist in available
+			for _, p := range slimPkgs {
+				if packageExists(p, available) {
+					result = append(result, p)
+				}
+			}
+			fmt.Printf("\033[34m==>\033[0m Expanding %s to: %s\n\n", name, strings.Join(slimPkgs, ", "))
+			continue
+		}
+
 		// Check for slim meta-package (e.g., php8.5-slim)
-		if matches := regexp.MustCompile(`^php(\d+\.\d+)-slim$`).FindStringSubmatch(name); len(matches) > 1 {
+		if matches := slimMetaRegex.FindStringSubmatch(name); len(matches) > 1 {
 			version := matches[1]
 			slimPkgs := []string{
 				"php" + version + "-common",
@@ -821,7 +962,7 @@ func expandMetaPackages(packages []string, available []pkg.Package) []string {
 		}
 
 		// Check for full meta-package (e.g., php8.5-full)
-		if matches := regexp.MustCompile(`^php(\d+\.\d+)-full$`).FindStringSubmatch(name); len(matches) > 1 {
+		if matches := fullMetaRegex.FindStringSubmatch(name); len(matches) > 1 {
 			version := matches[1]
 			prefix := "php" + version + "-"
 
@@ -876,9 +1017,48 @@ func packageExists(name string, available []pkg.Package) bool {
 }
 
 func runRemove(packages []string) error {
+	// Classify packages into tools and PHP packages
+	var toolsToRemove []string
+	var phpPackages []string
+
+	for _, name := range packages {
+		if tools.IsKnownTool(name) {
+			toolsToRemove = append(toolsToRemove, name)
+		} else {
+			phpPackages = append(phpPackages, name)
+		}
+	}
+
 	// Prompt for sudo password upfront
 	if err := ensureSudo(); err != nil {
 		return err
+	}
+
+	release, err := pkg.AcquireLock(cfg.InstallPrefix)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	// Remove tools first
+	if len(toolsToRemove) > 0 {
+		toolsMgr := getToolsManager()
+		if err := toolsMgr.LoadInstalled(); err != nil {
+			if cfg.Debug {
+				fmt.Printf("\033[33mWarning:\033[0m Could not load installed tools: %v\n", err)
+			}
+		}
+
+		for _, name := range toolsToRemove {
+			if err := toolsMgr.Remove(name); err != nil {
+				fmt.Printf("\033[31mError:\033[0m Failed to remove %s: %v\n", name, err)
+			}
+		}
+	}
+
+	// If no PHP packages to remove, we're done
+	if len(phpPackages) == 0 {
+		return nil
 	}
 
 	mgr := getManager()
@@ -888,7 +1068,7 @@ func runRemove(packages []string) error {
 
 	linker := getLinker()
 
-	for _, name := range packages {
+	for _, name := range phpPackages {
 		if !mgr.IsInstalled(name) {
 			fmt.Printf("\033[33mWarning:\033[0m Package %s is not installed\n", name)
 			continue
@@ -948,12 +1128,22 @@ func runList(pattern string, showAvailable, showInstalled bool) error {
 		}
 	}
 
+	// Load installed tools
+	toolsMgr := getToolsManager()
+	if err := toolsMgr.LoadInstalled(); err != nil {
+		if cfg.Debug {
+			fmt.Printf("\033[33mWarning:\033[0m Could not load installed tools: %v\n", err)
+		}
+	}
+
 	// If showing installed packages only
 	if showInstalled && !showAvailable {
 		installedPkgs := mgr.GetAllInstalled()
-		if len(installedPkgs) == 0 {
-			fmt.Println("No packages installed")
-			fmt.Println("\nUse: phm list -a  to show available packages")
+		installedTools := toolsMgr.GetAllInstalled()
+
+		if len(installedPkgs) == 0 && len(installedTools) == 0 {
+			fmt.Println("No packages or tools installed")
+			fmt.Println("\nUse: phm list -a  to show available packages and tools")
 			return nil
 		}
 
@@ -961,17 +1151,38 @@ func runList(pattern string, showAvailable, showInstalled bool) error {
 		fmt.Printf("%-35s %-12s %s\n", strings.Repeat("-", 35), strings.Repeat("-", 12), strings.Repeat("-", 30))
 
 		count := 0
-		for _, pkg := range installedPkgs {
-			if pattern != "" && !strings.Contains(pkg.Name, pattern) {
+
+		// Show PHP packages
+		for _, p := range installedPkgs {
+			if pattern != "" && !strings.Contains(p.Name, pattern) {
 				continue
 			}
 
-			desc := pkg.Description
+			desc := p.Description
 			if len(desc) > 40 {
 				desc = desc[:37] + "..."
 			}
 
-			fmt.Printf("%-35s %-12s %s\n", pkg.Name, pkg.Version, desc)
+			fmt.Printf("%-35s %-12s %s\n", p.Name, p.Version, desc)
+			count++
+		}
+
+		// Show tools
+		for _, t := range installedTools {
+			if pattern != "" && !strings.Contains(t.Name, pattern) {
+				continue
+			}
+
+			tool := tools.GetTool(t.Name)
+			desc := ""
+			if tool != nil {
+				desc = tool.Description
+			}
+			if len(desc) > 40 {
+				desc = desc[:37] + "..."
+			}
+
+			fmt.Printf("%-35s %-12s %s\n", t.Name, t.Version, desc)
 			count++
 		}
 
@@ -986,60 +1197,82 @@ func runList(pattern string, showAvailable, showInstalled bool) error {
 	}
 
 	packages := r.GetPackages()
-	if len(packages) == 0 {
-		fmt.Println("No packages found in repository")
-		fmt.Println("\nRun: phm update  to fetch package index")
-		return nil
-	}
 
-	fmt.Printf("\n\033[1m%-35s %-12s %-12s %s\033[0m\n", "Package", "Available", "Installed", "Description")
-	fmt.Printf("%-35s %-12s %-12s %s\n", strings.Repeat("-", 35), strings.Repeat("-", 12), strings.Repeat("-", 12), strings.Repeat("-", 25))
+	// Show tools first
+	fmt.Printf("\n\033[1mDeveloper Tools:\033[0m\n")
+	fmt.Printf("%-20s %-12s %s\n", strings.Repeat("-", 20), strings.Repeat("-", 12), strings.Repeat("-", 35))
 
-	countAvailable := 0
-	countInstalled := 0
-
-	for _, p := range packages {
-		if pattern != "" && !strings.Contains(p.Name, pattern) {
+	allTools := tools.GetAllTools()
+	toolsInstalled := 0
+	for name, t := range allTools {
+		if pattern != "" && !strings.Contains(name, pattern) {
 			continue
 		}
 
 		installedVer := "-"
-		installedPkg := mgr.GetInstalled(p.Name)
-		if installedPkg != nil {
-			countInstalled++
-
-			// Highlight if upgrade available
-			if pkg.CompareVersions(p.Version, installedPkg.Version) > 0 {
-				installedVer = fmt.Sprintf("\033[33m%s\033[0m", installedPkg.Version)
-			} else {
-				installedVer = fmt.Sprintf("\033[32m%s\033[0m", installedPkg.Version)
-			}
+		if inst := toolsMgr.GetInstalled(name); inst != nil {
+			installedVer = fmt.Sprintf("\033[32m%s\033[0m", inst.Version)
+			toolsInstalled++
 		}
 
-		desc := p.Description
-		if len(desc) > 30 {
-			desc = desc[:27] + "..."
-		}
-
-		fmt.Printf("%-35s %-12s %-21s %s\n", p.Name, p.Version, installedVer, desc)
-		countAvailable++
+		fmt.Printf("%-20s %-21s %s\n", name, installedVer, t.Description)
 	}
 
-	fmt.Printf("\nAvailable: %d, Installed: %d\n", countAvailable, countInstalled)
+	// Show PHP packages
+	if len(packages) > 0 {
+		fmt.Printf("\n\033[1mPHP Packages:\033[0m\n")
+		fmt.Printf("%-35s %-12s %-12s %s\n", strings.Repeat("-", 35), strings.Repeat("-", 12), strings.Repeat("-", 12), strings.Repeat("-", 25))
 
-	if countInstalled > 0 {
-		// Check for upgrades
-		upgradeCount := 0
+		countAvailable := 0
+		countInstalled := 0
+
 		for _, p := range packages {
-			if installedPkg := mgr.GetInstalled(p.Name); installedPkg != nil {
+			if pattern != "" && !strings.Contains(p.Name, pattern) {
+				continue
+			}
+
+			installedVer := "-"
+			installedPkg := mgr.GetInstalled(p.Name)
+			if installedPkg != nil {
+				countInstalled++
+
+				// Highlight if upgrade available
 				if pkg.CompareVersions(p.Version, installedPkg.Version) > 0 {
-					upgradeCount++
+					installedVer = fmt.Sprintf("\033[33m%s\033[0m", installedPkg.Version)
+				} else {
+					installedVer = fmt.Sprintf("\033[32m%s\033[0m", installedPkg.Version)
 				}
 			}
+
+			desc := p.Description
+			if len(desc) > 30 {
+				desc = desc[:27] + "..."
+			}
+
+			fmt.Printf("%-35s %-12s %-21s %s\n", p.Name, p.Version, installedVer, desc)
+			countAvailable++
 		}
-		if upgradeCount > 0 {
-			fmt.Printf("\033[33m%d package(s) can be upgraded. Run: phm upgrade\033[0m\n", upgradeCount)
+
+		fmt.Printf("\nPHP packages: %d available, %d installed\n", countAvailable, countInstalled)
+		fmt.Printf("Tools: %d available, %d installed\n", len(allTools), toolsInstalled)
+
+		if countInstalled > 0 {
+			// Check for upgrades
+			upgradeCount := 0
+			for _, p := range packages {
+				if installedPkg := mgr.GetInstalled(p.Name); installedPkg != nil {
+					if pkg.CompareVersions(p.Version, installedPkg.Version) > 0 {
+						upgradeCount++
+					}
+				}
+			}
+			if upgradeCount > 0 {
+				fmt.Printf("\033[33m%d package(s) can be upgraded. Run: phm upgrade\033[0m\n", upgradeCount)
+			}
 		}
+	} else {
+		fmt.Println("\nNo PHP packages found in repository")
+		fmt.Println("Run: phm update  to fetch package index")
 	}
 
 	return nil
@@ -1077,6 +1310,51 @@ func runUpgrade(packages []string) error {
 		return err
 	}
 
+	release, err := pkg.AcquireLock(cfg.InstallPrefix)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	// Handle tools upgrade
+	toolsMgr := getToolsManager()
+	if err := toolsMgr.LoadInstalled(); err != nil {
+		if cfg.Debug {
+			fmt.Printf("\033[33mWarning:\033[0m Could not load installed tools: %v\n", err)
+		}
+	}
+
+	// Upgrade tools first
+	var toolsToUpgrade []string
+	var phpPackages []string
+
+	if len(packages) == 0 {
+		// Upgrade all - including all installed tools
+		for _, t := range toolsMgr.GetAllInstalled() {
+			toolsToUpgrade = append(toolsToUpgrade, t.Name)
+		}
+	} else {
+		// Specific packages - classify them
+		for _, name := range packages {
+			if tools.IsKnownTool(name) {
+				toolsToUpgrade = append(toolsToUpgrade, name)
+			} else {
+				phpPackages = append(phpPackages, name)
+			}
+		}
+	}
+
+	// Upgrade tools
+	if len(toolsToUpgrade) > 0 {
+		fmt.Println("\033[34m==>\033[0m Checking for tool upgrades...")
+		for _, name := range toolsToUpgrade {
+			if err := toolsMgr.Upgrade(name); err != nil {
+				fmt.Printf("\033[31mError:\033[0m Failed to upgrade %s: %v\n", name, err)
+			}
+		}
+		fmt.Println()
+	}
+
 	r, err := getRepo()
 	if err != nil {
 		return err
@@ -1090,15 +1368,17 @@ func runUpgrade(packages []string) error {
 	// If no packages specified, check all installed packages
 	var toCheck []string
 	if len(packages) == 0 {
-		for _, pkg := range mgr.GetAllInstalled() {
-			toCheck = append(toCheck, pkg.Name)
+		for _, p := range mgr.GetAllInstalled() {
+			toCheck = append(toCheck, p.Name)
 		}
 	} else {
-		toCheck = packages
+		toCheck = phpPackages
 	}
 
 	if len(toCheck) == 0 {
-		fmt.Println("No packages installed")
+		if len(toolsToUpgrade) == 0 {
+			fmt.Println("No packages or tools installed")
+		}
 		return nil
 	}
 
@@ -1228,6 +1508,42 @@ func runUpgrade(packages []string) error {
 }
 
 func runInfo(pkgName string) error {
+	// Check if it's a tool
+	if tool := tools.GetTool(pkgName); tool != nil {
+		toolsMgr := getToolsManager()
+		_ = toolsMgr.LoadInstalled()
+
+		fmt.Printf("\n\033[1mTool: %s\033[0m\n\n", tool.Name)
+		fmt.Printf("  Description:  %s\n", tool.Description)
+		fmt.Printf("  Type:         %s\n", tool.Type)
+
+		// Show source based on type
+		switch tool.Type {
+		case tools.ToolTypeBootstrap:
+			fmt.Printf("  Source:       getcomposer.org\n")
+		case tools.ToolTypeBinary:
+			fmt.Printf("  Source:       https://github.com/%s\n", tool.GitHubRepo)
+		case tools.ToolTypePhar:
+			fmt.Printf("  Source:       composer (%s)\n", tool.ComposerPkg)
+		}
+
+		if installed := toolsMgr.GetInstalled(pkgName); installed != nil {
+			fmt.Printf("  Installed:    \033[32m%s\033[0m\n", installed.Version)
+			fmt.Printf("  Installed at: %s\n", installed.InstalledAt.Format("2006-01-02 15:04:05"))
+			if len(installed.InstalledFiles) > 0 {
+				fmt.Printf("\n  \033[1mInstalled files:\033[0m\n")
+				for _, f := range installed.InstalledFiles {
+					fmt.Printf("    %s\n", f)
+				}
+			}
+		} else {
+			fmt.Printf("  Installed:    \033[31mnot installed\033[0m\n")
+		}
+
+		fmt.Println()
+		return nil
+	}
+
 	r, err := getRepo()
 	if err != nil {
 		return err
@@ -1240,7 +1556,7 @@ func runInfo(pkgName string) error {
 	installedPkg := mgr.GetInstalled(pkgName)
 
 	if availablePkg == nil && installedPkg == nil {
-		return fmt.Errorf("package not found: %s", pkgName)
+		return fmt.Errorf("package or tool not found: %s", pkgName)
 	}
 
 	// Use available package info if exists, otherwise use installed
@@ -1315,8 +1631,10 @@ func runConfig() error {
 	fmt.Printf("  Mode:           %s\n", mode)
 	fmt.Printf("  Repository:     %s\n", cfg.GetRepoURL())
 	fmt.Printf("  Install prefix: %s\n", cfg.InstallPrefix)
+	fmt.Printf("  Tools prefix:   %s\n", cfg.ToolsPrefix)
 	fmt.Printf("  Cache dir:      %s\n", cfg.CacheDir)
 	fmt.Printf("  Data dir:       %s\n", cfg.DataDir)
+	fmt.Printf("  Tools data:     %s\n", cfg.ToolsDataDir)
 	fmt.Printf("  Platform:       %s\n", cfg.Platform())
 	fmt.Println()
 	return nil
@@ -1929,7 +2247,7 @@ func runSelfUpdate(force bool) error {
 	}
 
 	// Fetch latest release from GitHub
-	resp, err := http.Get("https://api.github.com/repos/phm-dev/phm/releases/latest")
+	resp, err := httputil.Client.Get("https://api.github.com/repos/phm-dev/phm/releases/latest")
 	if err != nil {
 		return fmt.Errorf("failed to check for updates: %w", err)
 	}
@@ -1994,21 +2312,32 @@ func runSelfUpdate(force bool) error {
 	defer os.RemoveAll(tmpDir)
 
 	tarPath := filepath.Join(tmpDir, assetName)
-	if err := downloadFile(tarPath, downloadURL); err != nil {
+	if err := tools.DownloadFile(tarPath, downloadURL); err != nil {
 		return fmt.Errorf("failed to download: %w", err)
+	}
+
+	// Verify SHA256 checksum if available
+	checksumURL := downloadURL + ".sha256"
+	checksumPath := filepath.Join(tmpDir, assetName+".sha256")
+	if err := tools.DownloadFile(checksumPath, checksumURL); err == nil {
+		checksumData, err := os.ReadFile(checksumPath)
+		if err == nil {
+			expectedHash := strings.Fields(strings.TrimSpace(string(checksumData)))[0]
+			if err := verifySHA256(tarPath, expectedHash); err != nil {
+				return fmt.Errorf("checksum verification failed: %w", err)
+			}
+			fmt.Printf("    Checksum verified\n")
+		}
+	} else {
+		fmt.Printf("\033[33m[!]\033[0m Checksum file not available, skipping verification\n")
 	}
 
 	fmt.Printf("\033[34m==>\033[0m Extracting...\n")
 
-	// Extract tarball
-	binaryPath := filepath.Join(tmpDir, "phm")
-	if err := extractTarGz(tarPath, tmpDir); err != nil {
+	// Extract tarball (with path traversal protection)
+	binaryPath, err := tools.ExtractTarGz(tarPath, tmpDir, "phm")
+	if err != nil {
 		return fmt.Errorf("failed to extract: %w", err)
-	}
-
-	// Verify the binary exists
-	if _, err := os.Stat(binaryPath); err != nil {
-		return fmt.Errorf("binary not found in archive")
 	}
 
 	// Get current binary path
@@ -2025,23 +2354,20 @@ func runSelfUpdate(force bool) error {
 
 	fmt.Printf("\033[34m==>\033[0m Installing to %s...\n", currentBinary)
 
-	// Check if we need sudo
-	needsSudo := false
-	if err := os.Rename(binaryPath, currentBinary); err != nil {
-		// Try with sudo
-		needsSudo = true
+	// Atomic binary replacement: stage to temp file in same directory, then rename
+	tmpBinary := currentBinary + ".new"
+	_ = exec.Command("sudo", "rm", "-f", tmpBinary).Run()
+
+	if err := runSudo("cp", binaryPath, tmpBinary); err != nil {
+		return fmt.Errorf("failed to stage binary: %w", err)
 	}
-
-	if needsSudo {
-		// Make the new binary executable first
-		if err := os.Chmod(binaryPath, 0755); err != nil {
-			return fmt.Errorf("failed to set permissions: %w", err)
-		}
-
-		// Use sudo to copy
-		if err := runSudo("cp", binaryPath, currentBinary); err != nil {
-			return fmt.Errorf("failed to install binary: %w", err)
-		}
+	if err := runSudo("chmod", "0755", tmpBinary); err != nil {
+		_ = exec.Command("sudo", "rm", "-f", tmpBinary).Run()
+		return fmt.Errorf("failed to set permissions: %w", err)
+	}
+	if err := runSudo("mv", tmpBinary, currentBinary); err != nil {
+		_ = exec.Command("sudo", "rm", "-f", tmpBinary).Run()
+		return fmt.Errorf("failed to install binary: %w", err)
 	}
 
 	fmt.Printf("\n\033[32m[OK]\033[0m Successfully updated to version %s\n", latestVersion)
@@ -2055,79 +2381,22 @@ func runSelfUpdate(force bool) error {
 	return nil
 }
 
-// downloadFile downloads a file from URL to the specified path
-func downloadFile(filepath string, url string) error {
-	resp, err := http.Get(url)
+// verifySHA256 computes the SHA256 of filePath and compares with expected hash
+func verifySHA256(filePath, expected string) error {
+	f, err := os.Open(filePath)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer f.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-
-	out, err := os.Create(filepath)
-	if err != nil {
+	h := crypto_sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
 		return err
 	}
-	defer out.Close()
 
-	_, err = io.Copy(out, resp.Body)
-	return err
-}
-
-// extractTarGz extracts a .tar.gz file to the specified directory
-func extractTarGz(tarPath, destDir string) error {
-	file, err := os.Open(tarPath)
-	if err != nil {
-		return err
+	actual := fmt.Sprintf("%x", h.Sum(nil))
+	if actual != expected {
+		return fmt.Errorf("expected %s, got %s", expected, actual)
 	}
-	defer file.Close()
-
-	gzr, err := gzip.NewReader(file)
-	if err != nil {
-		return err
-	}
-	defer gzr.Close()
-
-	tr := tar.NewReader(gzr)
-
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-
-		target := filepath.Join(destDir, header.Name)
-
-		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0755); err != nil {
-				return err
-			}
-		case tar.TypeReg:
-			outFile, err := os.Create(target)
-			if err != nil {
-				return err
-			}
-			if _, err := io.Copy(outFile, tr); err != nil {
-				outFile.Close()
-				return err
-			}
-			outFile.Close()
-
-			// Preserve executable permissions
-			if header.Mode&0111 != 0 {
-				if err := os.Chmod(target, 0755); err != nil {
-					return err
-				}
-			}
-		}
-	}
-
 	return nil
 }

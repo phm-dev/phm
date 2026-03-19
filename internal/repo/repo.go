@@ -1,6 +1,8 @@
 package repo
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/phm-dev/phm/internal/config"
+	"github.com/phm-dev/phm/internal/httputil"
 	"github.com/phm-dev/phm/internal/pkg"
 	"github.com/schollz/progressbar/v3"
 )
@@ -67,7 +70,12 @@ func (r *Repository) FetchIndex() error {
 	// Add timestamp to bypass GitHub's CDN cache
 	url := fmt.Sprintf("%s/index.json?t=%d", r.cfg.RepoURL, time.Now().Unix())
 
-	resp, err := http.Get(url)
+	// Enforce HTTPS for remote index
+	if !strings.HasPrefix(url, "https://") {
+		return fmt.Errorf("refusing non-HTTPS index URL: %s", url)
+	}
+
+	resp, err := httputil.Client.Get(url)
 	if err != nil {
 		return fmt.Errorf("failed to fetch index: %w", err)
 	}
@@ -77,7 +85,7 @@ func (r *Repository) FetchIndex() error {
 		return fmt.Errorf("failed to fetch index: HTTP %d", resp.StatusCode)
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024)) // 10MB max index
 	if err != nil {
 		return fmt.Errorf("failed to read index: %w", err)
 	}
@@ -148,6 +156,31 @@ func (r *Repository) SearchPackages(query string) []pkg.Package {
 	return results
 }
 
+// verifyChecksum verifies the SHA256 checksum of a file.
+// Returns nil if expectedSHA256 is empty (backward compatibility).
+func verifyChecksum(filePath, expectedSHA256 string) error {
+	if expectedSHA256 == "" {
+		return nil
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open file for checksum: %w", err)
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return fmt.Errorf("failed to compute checksum: %w", err)
+	}
+
+	actual := hex.EncodeToString(h.Sum(nil))
+	if actual != expectedSHA256 {
+		return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedSHA256, actual)
+	}
+	return nil
+}
+
 // DownloadPackage downloads a package to cache with progress bar
 func (r *Repository) DownloadPackage(p *pkg.Package) (string, error) {
 	filename := fmt.Sprintf("%s_%s-%d_%s.tar.zst", p.Name, p.Version, p.Revision, p.Platform)
@@ -164,21 +197,31 @@ func (r *Repository) DownloadPackage(p *pkg.Package) (string, error) {
 	// Check cache
 	cachePath := r.cfg.GetPackagePath(filename)
 	if _, err := os.Stat(cachePath); err == nil {
-		// TODO: verify checksum
-		return cachePath, nil
+		// Verify cached file checksum
+		if err := verifyChecksum(cachePath, p.SHA256); err != nil {
+			os.Remove(cachePath)
+			// Fall through to re-download
+		} else {
+			return cachePath, nil
+		}
 	}
 
-	// Download
+	// Determine download URL
 	url := p.URL
 	if url == "" {
 		url = r.cfg.RepoURL + "/" + filename
+	}
+
+	// Enforce HTTPS for remote downloads
+	if !strings.HasPrefix(url, "https://") {
+		return "", fmt.Errorf("refusing non-HTTPS download URL: %s", url)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0755); err != nil {
 		return "", err
 	}
 
-	resp, err := http.Get(url)
+	resp, err := httputil.Client.Get(url)
 	if err != nil {
 		return "", fmt.Errorf("failed to download: %w", err)
 	}
@@ -192,7 +235,6 @@ func (r *Repository) DownloadPackage(p *pkg.Package) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer out.Close()
 
 	// Create progress bar
 	bar := progressbar.NewOptions64(
@@ -215,8 +257,16 @@ func (r *Repository) DownloadPackage(p *pkg.Package) (string, error) {
 
 	// Copy with progress
 	if _, err := io.Copy(io.MultiWriter(out, bar), resp.Body); err != nil {
+		out.Close()
 		os.Remove(cachePath)
 		return "", err
+	}
+	out.Close()
+
+	// Verify downloaded file checksum
+	if err := verifyChecksum(cachePath, p.SHA256); err != nil {
+		os.Remove(cachePath)
+		return "", fmt.Errorf("downloaded package verification failed: %w", err)
 	}
 
 	return cachePath, nil

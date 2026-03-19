@@ -19,6 +19,10 @@ type Config struct {
 	CacheDir      string
 	DataDir       string
 	ConfigDir     string
+
+	// Tools paths
+	ToolsPrefix  string // /opt/phm/bin - where tools are installed
+	ToolsDataDir string // ~/.local/share/phm/tools - tools metadata
 }
 
 // New creates a new Config with default values
@@ -34,6 +38,8 @@ func New() *Config {
 		CacheDir:      filepath.Join(homeDir, ".cache", "phm"),
 		DataDir:       filepath.Join(homeDir, ".local", "share", "phm"),
 		ConfigDir:     filepath.Join(homeDir, ".config", "phm"),
+		ToolsPrefix:   "/opt/phm/bin",
+		ToolsDataDir:  filepath.Join(homeDir, ".local", "share", "phm", "tools"),
 	}
 
 	return cfg
@@ -98,6 +104,7 @@ func (c *Config) EnsureDirs() error {
 		c.DataDir,
 		filepath.Join(c.DataDir, "installed"),
 		c.ConfigDir,
+		c.ToolsDataDir,
 	}
 
 	for _, dir := range dirs {

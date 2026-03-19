@@ -27,7 +27,7 @@ func AcquireLock(lockDir string) (func(), error) {
 		return nil, fmt.Errorf("another PHM process is running, lock file: %s", lockPath)
 	}
 	release := func() {
-		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 		f.Close()
 		os.Remove(lockPath)
 	}

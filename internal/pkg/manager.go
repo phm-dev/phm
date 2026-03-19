@@ -30,16 +30,16 @@ const (
 )
 
 var (
-	dependencyRegex     = regexp.MustCompile(`^([a-zA-Z0-9._-]+)\s*\(([<>=]+)\s*([0-9.]+)\)$`)
-	installedVersionRe  = regexp.MustCompile(`^php(\d+\.\d+)`)
+	dependencyRegex    = regexp.MustCompile(`^([a-zA-Z0-9._-]+)\s*\(([<>=]+)\s*([0-9.]+)\)$`)
+	installedVersionRe = regexp.MustCompile(`^php(\d+\.\d+)`)
 	// installSlotRegex validates InstallSlot values (e.g., "8.5" or "8.5.1")
-	installSlotRegex    = regexp.MustCompile(`^\d+\.\d+(\.\d+)?$`)
+	installSlotRegex = regexp.MustCompile(`^\d+\.\d+(\.\d+)?$`)
 	// safeNameRegex validates package names for safe use in file paths
-	safeNameRegex       = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._+\-]*$`)
+	safeNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._+\-]*$`)
 	// safeVersionRegex validates version strings (e.g., "8.5.0", "6.1.0", "0.3.0+pie")
-	safeVersionRegex    = regexp.MustCompile(`^\d+(\.\d+)+([+][a-zA-Z0-9]+)?$`)
+	safeVersionRegex = regexp.MustCompile(`^\d+(\.\d+)+([+][a-zA-Z0-9]+)?$`)
 	// safeUsernameRegex validates OS usernames for config placeholder injection prevention
-	safeUsernameRegex   = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+	safeUsernameRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 )
 
 // Manager handles package operations
@@ -331,16 +331,6 @@ type InstallOptions struct {
 // (e.g., FPM LaunchDaemon plists)
 var allowedSystemPrefixes = []string{
 	"/Library/LaunchDaemons/",
-}
-
-// validateExtractPath ensures destPath is under the allowed prefix to prevent path traversal
-func validateExtractPath(destPath, allowedPrefix string) error {
-	cleanDest := filepath.Clean(destPath)
-	cleanPrefix := filepath.Clean(allowedPrefix) + string(os.PathSeparator)
-	if !strings.HasPrefix(cleanDest, cleanPrefix) {
-		return fmt.Errorf("path traversal detected: %q escapes %q", destPath, allowedPrefix)
-	}
-	return nil
 }
 
 // validateInstallPath checks that destPath is under the install prefix or a known system path

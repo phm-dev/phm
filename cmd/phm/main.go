@@ -27,24 +27,24 @@ var (
 	cfg     *config.Config
 
 	// Precompiled regexps for package name classification and parsing
-	phpMetaRegex      = regexp.MustCompile(`^php\d+\.\d+(-slim|-full)?$`)
-	phpPackageRegex   = regexp.MustCompile(`^php\d+\.\d+(\.\d+)?-.+`)
-	patchVersionRe    = regexp.MustCompile(`^php(\d+\.\d+\.\d+)`)
-	minorVersionRe    = regexp.MustCompile(`^php(\d+\.\d+)`)
-	oldFormatRegex    = regexp.MustCompile(`^php(\d+\.\d+)\.\d+-([a-z]+)[\d.]*$`)
-	bareVersionRegex  = regexp.MustCompile(`^php(\d+\.\d+)$`)
-	slimMetaRegex     = regexp.MustCompile(`^php(\d+\.\d+)-slim$`)
-	fullMetaRegex     = regexp.MustCompile(`^php(\d+\.\d+)-full$`)
+	phpMetaRegex     = regexp.MustCompile(`^php\d+\.\d+(-slim|-full)?$`)
+	phpPackageRegex  = regexp.MustCompile(`^php\d+\.\d+(\.\d+)?-.+`)
+	patchVersionRe   = regexp.MustCompile(`^php(\d+\.\d+\.\d+)`)
+	minorVersionRe   = regexp.MustCompile(`^php(\d+\.\d+)`)
+	oldFormatRegex   = regexp.MustCompile(`^php(\d+\.\d+)\.\d+-([a-z]+)[\d.]*$`)
+	bareVersionRegex = regexp.MustCompile(`^php(\d+\.\d+)$`)
+	slimMetaRegex    = regexp.MustCompile(`^php(\d+\.\d+)-slim$`)
+	fullMetaRegex    = regexp.MustCompile(`^php(\d+\.\d+)-full$`)
 )
 
 // PackageType represents what kind of package we're dealing with
 type PackageType int
 
 const (
-	TypeUnknown PackageType = iota
-	TypeTool                // composer, symfony, phpstan, etc.
-	TypePHPMeta             // php8.5, php8.5-slim, php8.5-full
-	TypePHPPackage          // php8.5-cli, php8.5-fpm, php8.5-redis
+	TypeUnknown    PackageType = iota
+	TypeTool                   // composer, symfony, phpstan, etc.
+	TypePHPMeta                // php8.5, php8.5-slim, php8.5-full
+	TypePHPPackage             // php8.5-cli, php8.5-fpm, php8.5-redis
 )
 
 // classifyPackage determines whether a package name is a tool, PHP meta-package, or PHP package
@@ -1384,10 +1384,10 @@ func runUpgrade(packages []string) error {
 
 	// Find packages with available upgrades
 	type upgrade struct {
-		installedName  string // Name in installed DB (e.g., php8.5.0-cli)
-		canonicalName  string // Name in index (e.g., php8.5-cli)
-		oldVersion     string
-		newVersion     string
+		installedName string // Name in installed DB (e.g., php8.5.0-cli)
+		canonicalName string // Name in index (e.g., php8.5-cli)
+		oldVersion    string
+		newVersion    string
 	}
 	var upgrades []upgrade
 
@@ -1408,10 +1408,10 @@ func runUpgrade(packages []string) error {
 
 		if newVer := mgr.CheckUpgradeWithPHP(name, available.Version, available.PHPVersion); newVer != "" {
 			upgrades = append(upgrades, upgrade{
-				installedName:  name,
-				canonicalName:  canonicalName,
-				oldVersion:     installed.Version,
-				newVersion:     newVer,
+				installedName: name,
+				canonicalName: canonicalName,
+				oldVersion:    installed.Version,
+				newVersion:    newVer,
 			})
 		}
 	}
